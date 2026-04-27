@@ -1362,6 +1362,13 @@ fn describe_select(s: &SelectStmt) -> String {
         lines.push("  Limit / Offset".into());
     }
     lines.push(format!("  Project ({} items)", s.items.len()));
+    for u in &s.unions {
+        let kind = if u.all { "UNION ALL" } else { "UNION" };
+        lines.push(format!("{kind}:"));
+        for sub in describe_select(&u.query).lines() {
+            lines.push(format!("  {sub}"));
+        }
+    }
     lines.join("\n")
 }
 
