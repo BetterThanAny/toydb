@@ -1586,6 +1586,60 @@ mod tests {
 
     // ----- NULLS FIRST/LAST -------------------------------------------
 
+    // ----- Scalar subqueries -----------------------------------------
+
+    #[test]
+    fn scalar_subquery_in_where() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, n INT);
+            INSERT INTO t VALUES (1,10),(2,30),(3,20);
+        ");
+        let r = run(&mut e, "SELECT id FROM t WHERE n = (SELECT MAX(n) FROM t)").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(2));
+    }
+
+    #[test]
+    fn scalar_subquery_in_select() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, n INT);
+            INSERT INTO t VALUES (1,10),(2,20),(3,30);
+        ");
+        let r = run(&mut e, "SELECT id, n - (SELECT AVG(n) FROM t) AS diff FROM t ORDER BY id").unwrap();
+        let rows = assert_select(&r);
+        // avg = 20 → diffs are -10, 0, 10 (as floats)
+        assert_eq!(rows[0][1], Value::Float(-10.0));
+        assert_eq!(rows[1][1], Value::Float(0.0));
+        assert_eq!(rows[2][1], Value::Float(10.0));
+    }
+
+    #[test]
+    fn scalar_subquery_zero_rows_yields_null() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, n INT);
+            INSERT INTO t VALUES (1,10);
+            CREATE TABLE empty (id INT PRIMARY KEY);
+        ");
+        let r = run(&mut e, "SELECT (SELECT id FROM empty) AS v").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows[0][0], Value::Null);
+    }
+
+    #[test]
+    fn scalar_subquery_multiple_rows_errors() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY);
+            INSERT INTO t VALUES (1),(2),(3);
+        ");
+        let r = try_run(&mut e, "SELECT (SELECT id FROM t) AS v");
+        assert!(r.is_err());
+    }
+
     // ----- ALTER TABLE ADD COLUMN -------------------------------------
 
     #[test]
