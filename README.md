@@ -26,7 +26,7 @@ toydb> SELECT title, year FROM movies WHERE year >= 2016 ORDER BY rating DESC LI
 | Type system | NULL, BOOLEAN, INTEGER, FLOAT, STRING — with SQL three-valued logic |
 | Expressions | Arithmetic, comparison, logic, string concat, IS NULL, IN, BETWEEN, LIKE, `CASE WHEN`, scalar functions (`abs`, `lower`, `upper`, `length`, `substring`, `coalesce`, `nullif`, `iff`, `concat`, ...) |
 | Aggregates | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with `GROUP BY` / `HAVING` / `DISTINCT` (e.g. `COUNT(DISTINCT col)`) |
-| Query shaping | `SELECT DISTINCT`, alias-aware `ORDER BY` (`ORDER BY <SELECT alias>`), `LIMIT` / `OFFSET` |
+| Query shaping | `SELECT DISTINCT`, alias-aware `ORDER BY` (`ORDER BY <SELECT alias>`), `LIMIT` / `OFFSET`, `UNION` / `UNION ALL`, scalar subqueries `(SELECT ...)` |
 | Joins | `INNER`, `LEFT`, `RIGHT` (nested-loop) |
 | Storage engines | In-memory `MemoryEngine` and disk-backed `DiskEngine` (page-based, slotted pages, free list) |
 | Durability | Write-ahead log, recovery on open, torn-write tolerance |
@@ -36,7 +36,8 @@ toydb> SELECT title, year FROM movies WHERE year >= 2016 ORDER BY rating DESC LI
 ## What it does NOT
 
 - Network protocol (no Postgres / MySQL wire — single process REPL only)
-- Correlated subqueries, CTEs, window functions, UNION (only **uncorrelated scalar** subqueries are supported)
+- Correlated subqueries, CTEs, window functions (only **uncorrelated scalar** subqueries supported)
+- `ORDER BY` / `LIMIT` on `UNION`'d results (we accept the unions but reject the trailing clauses; wrap with a query that's more capable than toydb if you need it)
 - Real query optimisation (no indexes, no statistics, plan = nested loop everywhere)
 - Distributed anything (no replication, no sharding, no consensus)
 - Concurrent transactions (toydb is single-threaded)
