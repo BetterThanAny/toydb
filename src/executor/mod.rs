@@ -5,6 +5,7 @@
 //! intentionally non-generic: the goal is correctness and readability,
 //! not throughput.
 
+pub mod aggregate;
 pub mod expr;
 pub mod plan;
 pub mod result;

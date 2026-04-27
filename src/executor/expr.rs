@@ -449,6 +449,14 @@ fn substring(vs: &[Value]) -> Result<Value> {
 // LIKE pattern matching
 // ---------------------------------------------------------------------
 
+/// Re-export of `like_match` for use by sibling executor modules — the
+/// inner helper is intentionally not `pub`, but the aggregate evaluator
+/// needs structural access to mirror LIKE semantics inside grouped
+/// projections.
+pub(crate) fn like_match_for_test(haystack: &str, pattern: &str) -> bool {
+    like_match(haystack, pattern)
+}
+
 /// SQL `LIKE`: `_` matches any single character, `%` matches zero or
 /// more. Escaping is not supported (we'd need an `ESCAPE` clause).
 fn like_match(haystack: &str, pattern: &str) -> bool {
