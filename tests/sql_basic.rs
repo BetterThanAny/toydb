@@ -3,9 +3,8 @@
 //! These exercise the public surface (Parser + Executor) the same way
 //! the REPL does, catching wiring bugs that unit tests don't.
 
-use toydb::engine::MemoryEngine;
-use toydb::executor::Executor;
-use toydb::executor::ResultSet;
+use toydb::engine::{Engine, MemoryEngine};
+use toydb::executor::{Executor, ResultSet};
 use toydb::sql::Parser;
 use toydb::types::value::Value;
 
