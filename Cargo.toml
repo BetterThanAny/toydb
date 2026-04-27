@@ -1,0 +1,26 @@
+[package]
+name = "toydb"
+version = "0.1.0"
+edition = "2024"
+description = "A from-scratch SQL database engine in Rust: lexer, parser, MVCC, B-tree storage, WAL"
+license = "MIT"
+
+[lib]
+name = "toydb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "toydb"
+path = "src/bin/toydb.rs"
+
+[dependencies]
+thiserror = "2.0"
+rustyline = "15.0"
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
