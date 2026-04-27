@@ -151,7 +151,46 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
             let m = like_match(&s, &pat);
             Ok(Value::Boolean(if *negated { !m } else { m }))
         }
-        Expression::Function { name, args } => apply_function(name, args, r),
+        Expression::Function { name, args, distinct } => {
+            if *distinct {
+                return Err(Error::ty(format!(
+                    "DISTINCT is only supported inside aggregate calls, not `{name}`"
+                )));
+            }
+            apply_function(name, args, r)
+        }
+        Expression::Case { operand, branches, otherwise } => {
+            // Switch form evaluates `operand` once and compares it against
+            // each WHEN expression with SQL equality (NULL never matches).
+            // Boolean form treats each WHEN as a predicate.
+            match operand {
+                Some(op) => {
+                    let target = eval_with(op, r)?;
+                    for (when, then) in branches {
+                        let candidate = eval_with(when, r)?;
+                        if let Some(true) = target.equal_sql(&candidate)? {
+                            return eval_with(then, r);
+                        }
+                    }
+                }
+                None => {
+                    for (when, then) in branches {
+                        match eval_with(when, r)? {
+                            Value::Boolean(true) => return eval_with(then, r),
+                            Value::Boolean(false) | Value::Null => continue,
+                            other => return Err(Error::ty(format!(
+                                "CASE WHEN expects boolean, got {}",
+                                other.type_name()
+                            ))),
+                        }
+                    }
+                }
+            }
+            match otherwise {
+                Some(e) => eval_with(e, r),
+                None => Ok(Value::Null),
+            }
+        }
     }
 }
 
@@ -714,6 +753,36 @@ mod tests {
         let e = p.parse_expression().unwrap();
         let r = OneCol("a", Value::Integer(5));
         assert_eq!(eval_with(&e, &r).unwrap(), Value::Integer(15));
+    }
+
+    // -------- CASE -----------------------------------------------------
+
+    #[test]
+    fn case_boolean_form() {
+        // CASE WHEN cond THEN ... ELSE ...
+        assert_eq!(ev("CASE WHEN TRUE THEN 1 ELSE 2 END"), Value::Integer(1));
+        assert_eq!(ev("CASE WHEN FALSE THEN 1 ELSE 2 END"), Value::Integer(2));
+        assert_eq!(ev("CASE WHEN NULL THEN 1 ELSE 2 END"), Value::Integer(2));
+    }
+
+    #[test]
+    fn case_no_else_returns_null() {
+        assert_eq!(ev("CASE WHEN FALSE THEN 1 END"), Value::Null);
+    }
+
+    #[test]
+    fn case_switch_form() {
+        // CASE expr WHEN val THEN ...
+        assert_eq!(ev("CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END"),
+            Value::String("b".into()));
+        assert_eq!(ev("CASE 'x' WHEN 'y' THEN 1 ELSE 2 END"), Value::Integer(2));
+    }
+
+    #[test]
+    fn case_chained_conditions() {
+        // First matching WHEN wins.
+        let e = "CASE WHEN 1 = 2 THEN 'a' WHEN 1 < 2 THEN 'b' WHEN TRUE THEN 'c' END";
+        assert_eq!(ev(e), Value::String("b".into()));
     }
 
     #[test]

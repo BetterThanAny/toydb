@@ -117,6 +117,7 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<SelectStmt> {
         self.expect(Token::KwSelect)?;
+        let distinct = self.consume_if(&Token::KwDistinct);
 
         let mut items = Vec::new();
         loop {
@@ -190,7 +191,7 @@ impl Parser {
             None
         };
 
-        Ok(SelectStmt { items, from, r#where, group_by, having, order_by, limit, offset })
+        Ok(SelectStmt { distinct, items, from, r#where, group_by, having, order_by, limit, offset })
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -668,6 +669,7 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<Expression> {
         let t = self.peek().cloned().ok_or_else(|| self.err_here("unexpected EOF in expression"))?;
         match &t.token {
+            Token::KwCase => self.parse_case(),
             Token::KwNull => {
                 self.bump();
                 Ok(Expression::Literal(Literal::Null))
@@ -712,6 +714,7 @@ impl Parser {
                 // function call?
                 if self.consume_if(&Token::LParen) {
                     let mut args = Vec::new();
+                    let distinct = self.consume_if(&Token::KwDistinct);
                     if !matches!(self.peek_tok(), Some(Token::RParen)) {
                         if matches!(self.peek_tok(), Some(Token::Star)) {
                             // COUNT(*)
@@ -727,7 +730,7 @@ impl Parser {
                         }
                     }
                     self.expect(Token::RParen)?;
-                    return Ok(Expression::Function { name, args });
+                    return Ok(Expression::Function { name, args, distinct });
                 }
                 // qualified `t.col`?
                 if self.consume_if(&Token::Dot) {
@@ -742,6 +745,35 @@ impl Parser {
                 format!("unexpected token in expression: {}", other.as_str()),
             )),
         }
+    }
+
+    fn parse_case(&mut self) -> Result<Expression> {
+        self.expect(Token::KwCase)?;
+        // Switch form: `CASE expr WHEN ... THEN ... ELSE ... END`.
+        // Boolean form: `CASE WHEN cond THEN ... WHEN ... ELSE ... END`.
+        let operand = if matches!(self.peek_tok(), Some(Token::KwWhen)) {
+            None
+        } else {
+            Some(Box::new(self.parse_expression()?))
+        };
+        let mut branches = Vec::new();
+        loop {
+            self.expect(Token::KwWhen)?;
+            let when = self.parse_expression()?;
+            self.expect(Token::KwThen)?;
+            let then = self.parse_expression()?;
+            branches.push((when, then));
+            if !matches!(self.peek_tok(), Some(Token::KwWhen)) {
+                break;
+            }
+        }
+        let otherwise = if self.consume_if(&Token::KwElse) {
+            Some(Box::new(self.parse_expression()?))
+        } else {
+            None
+        };
+        self.expect(Token::KwEnd)?;
+        Ok(Expression::Case { operand, branches, otherwise })
     }
 
     // ------------------------------------------------------------------
@@ -996,9 +1028,10 @@ mod tests {
     fn expr_function_call() {
         let e = parse_expr("upper(name)");
         match e {
-            Expression::Function { name, args } => {
+            Expression::Function { name, args, distinct } => {
                 assert_eq!(name, "upper");
                 assert_eq!(args, vec![col("name")]);
+                assert!(!distinct);
             }
             _ => panic!("expected Function"),
         }
@@ -1008,9 +1041,22 @@ mod tests {
     fn expr_count_star() {
         let e = parse_expr("count(*)");
         match e {
-            Expression::Function { name, args } => {
+            Expression::Function { name, args, distinct } => {
                 assert_eq!(name, "count");
                 assert_eq!(args, vec![Expression::Wildcard]);
+                assert!(!distinct);
+            }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn expr_count_distinct() {
+        let e = parse_expr("count(DISTINCT id)");
+        match e {
+            Expression::Function { name, distinct, .. } => {
+                assert_eq!(name, "count");
+                assert!(distinct);
             }
             _ => panic!("expected Function"),
         }

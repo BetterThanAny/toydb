@@ -91,6 +91,12 @@ pub enum Token {
     KwRollback,
     KwTransaction,
     KwExplain,
+    KwDistinct,
+    KwCase,
+    KwWhen,
+    KwThen,
+    KwElse,
+    KwEnd,
 
     // -- punctuation -----------------------------------------------------
     Comma,
@@ -209,6 +215,12 @@ fn keyword(upper: &str) -> Option<Token> {
         "ROLLBACK" => KwRollback,
         "TRANSACTION" => KwTransaction,
         "EXPLAIN" => KwExplain,
+        "DISTINCT" => KwDistinct,
+        "CASE" => KwCase,
+        "WHEN" => KwWhen,
+        "THEN" => KwThen,
+        "ELSE" => KwElse,
+        "END" => KwEnd,
         _ => return None,
     })
 }

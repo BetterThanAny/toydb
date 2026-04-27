@@ -4,8 +4,10 @@
 //! around the trait — that way swapping the in-memory backend for a
 //! disk-backed one is a one-line change in `main`.
 
+pub mod disk;
 pub mod memory;
 
+pub use disk::DiskEngine;
 pub use memory::MemoryEngine;
 
 use crate::catalog::Table;
@@ -32,4 +34,34 @@ pub trait Engine {
     fn update(&mut self, table: &str, id: RowId, row: Row) -> Result<()>;
     fn delete(&mut self, table: &str, id: RowId) -> Result<()>;
     fn get(&self, table: &str, id: RowId) -> Result<Option<Row>>;
+
+    // -- Transactions --------------------------------------------------
+    //
+    // Default implementations decline transactions outright. Engines
+    // that do support them (e.g. [`MemoryEngine`]) override these.
+
+    /// Begin a transaction. Subsequent writes are buffered until
+    /// [`commit`] or [`rollback`].
+    fn begin(&mut self) -> Result<()> {
+        Err(crate::error::Error::other(
+            "this engine does not support transactions",
+        ))
+    }
+
+    /// Commit the in-progress transaction. No-op if no transaction.
+    fn commit(&mut self) -> Result<()> {
+        Err(crate::error::Error::other(
+            "this engine does not support transactions",
+        ))
+    }
+
+    /// Roll back the in-progress transaction.
+    fn rollback(&mut self) -> Result<()> {
+        Err(crate::error::Error::other(
+            "this engine does not support transactions",
+        ))
+    }
+
+    /// Whether a transaction is currently in progress.
+    fn in_transaction(&self) -> bool { false }
 }

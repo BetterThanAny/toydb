@@ -42,9 +42,18 @@ impl<'a> Executor<'a> {
             Statement::Select(s) => self.exec_select(s),
             Statement::Update(s) => self.exec_update(s),
             Statement::Delete(s) => self.exec_delete(s),
-            Statement::Begin => Err(Error::other("BEGIN: transactions land in M9")),
-            Statement::Commit => Err(Error::other("COMMIT: transactions land in M9")),
-            Statement::Rollback => Err(Error::other("ROLLBACK: transactions land in M9")),
+            Statement::Begin => {
+                self.engine.begin()?;
+                Ok(ResultSet::Begin)
+            }
+            Statement::Commit => {
+                self.engine.commit()?;
+                Ok(ResultSet::Commit)
+            }
+            Statement::Rollback => {
+                self.engine.rollback()?;
+                Ok(ResultSet::Rollback)
+            }
             Statement::Explain(_) => Err(Error::other("EXPLAIN is not implemented yet")),
         }
     }
@@ -216,8 +225,11 @@ impl<'a> Executor<'a> {
         let offset = limit_eval(&s.offset, "OFFSET")?;
         let limit = limit_eval(&s.limit, "LIMIT")?;
 
-        let mut out = Vec::new();
-        for row in rows.into_iter().skip(offset).take(limit) {
+        // Project each row; if DISTINCT is set, dedupe by total ordering.
+        let mut projected: Vec<Row> = Vec::new();
+        let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
+        for row in rows.into_iter().skip(offset) {
+            if projected.len() >= limit { break; }
             let resolver = WideResolver { schema, row: &row };
             let mut emitted = Vec::with_capacity(plan.len());
             for proj in &plan {
@@ -227,9 +239,15 @@ impl<'a> Executor<'a> {
                 };
                 emitted.push(v);
             }
-            out.push(Row(emitted));
+            if s.distinct {
+                let key = GroupKey(emitted.clone());
+                if !seen.insert(key) {
+                    continue;
+                }
+            }
+            projected.push(Row(emitted));
         }
-        Ok(ResultSet::Select { columns, rows: out })
+        Ok(ResultSet::Select { columns, rows: projected })
     }
 
     /// Grouped projection: builds groups, accumulates aggregates, then
@@ -310,13 +328,16 @@ impl<'a> Executor<'a> {
                         (Some(a), _) => a.clone(),
                         (None, Expression::Column(c)) => c.clone(),
                         (None, Expression::Qualified(_, c)) => c.clone(),
-                        (None, Expression::Function { name, args })
+                        (None, Expression::Function { name, args, distinct })
                             if aggregate_kind(name).is_some() =>
                         {
+                            let upper = name.to_ascii_uppercase();
                             if args.iter().any(|a| matches!(a, Expression::Wildcard)) {
-                                format!("{}(*)", name.to_ascii_uppercase())
+                                format!("{}(*)", upper)
+                            } else if *distinct {
+                                format!("{}(DISTINCT)", upper)
                             } else {
-                                name.to_ascii_uppercase()
+                                upper
                             }
                         }
                         _ => format!("col{}", i + 1),
@@ -400,12 +421,16 @@ impl<'a> Executor<'a> {
 
         let offset = limit_eval(&s.offset, "OFFSET")?;
         let limit = limit_eval(&s.limit, "LIMIT")?;
-        let rows: Vec<Row> = emitted
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|e| e.row)
-            .collect();
+        let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
+        let mut rows: Vec<Row> = Vec::new();
+        for e in emitted.into_iter().skip(offset) {
+            if rows.len() >= limit { break; }
+            if s.distinct {
+                let key = GroupKey(e.row.0.clone());
+                if !seen.insert(key) { continue; }
+            }
+            rows.push(e.row);
+        }
         Ok(ResultSet::Select { columns, rows })
     }
 
@@ -930,9 +955,18 @@ fn rewrite_aliases(expr: &Expression, aliases: &HashMap<&str, &Expression>) -> E
             pattern: Box::new(rewrite_aliases(pattern, aliases)),
             negated: *negated,
         },
-        Expression::Function { name, args } => Expression::Function {
+        Expression::Function { name, args, distinct } => Expression::Function {
             name: name.clone(),
             args: args.iter().map(|a| rewrite_aliases(a, aliases)).collect(),
+            distinct: *distinct,
+        },
+        Expression::Case { operand, branches, otherwise } => Expression::Case {
+            operand: operand.as_ref().map(|e| Box::new(rewrite_aliases(e, aliases))),
+            branches: branches
+                .iter()
+                .map(|(w, t)| (rewrite_aliases(w, aliases), rewrite_aliases(t, aliases)))
+                .collect(),
+            otherwise: otherwise.as_ref().map(|e| Box::new(rewrite_aliases(e, aliases))),
         },
     }
 }
@@ -1182,6 +1216,73 @@ mod tests {
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::String("bob".into()));
+    }
+
+    // ----- DISTINCT ---------------------------------------------------
+
+    #[test]
+    fn select_distinct_dedupes() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, c TEXT);
+            INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a'),(4,'b'),(5,'c');
+        ");
+        let r = run(&mut e, "SELECT DISTINCT c FROM t ORDER BY c").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn select_distinct_with_limit() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, c TEXT);
+            INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a'),(4,'c');
+        ");
+        let r = run(&mut e, "SELECT DISTINCT c FROM t ORDER BY c LIMIT 2").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn count_distinct_dedupes_values() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, c TEXT);
+            INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a'),(4,'a'),(5,'c'),(6,NULL);
+        ");
+        let r = run(&mut e, "SELECT COUNT(*), COUNT(c), COUNT(DISTINCT c) FROM t").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows[0][0], Value::Integer(6)); // all rows
+        assert_eq!(rows[0][1], Value::Integer(5)); // non-null
+        assert_eq!(rows[0][2], Value::Integer(3)); // a, b, c
+    }
+
+    #[test]
+    fn sum_distinct_dedupes() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, n INT);
+            INSERT INTO t VALUES (1,5),(2,5),(3,7),(4,5);
+        ");
+        let r = run(&mut e, "SELECT SUM(n), SUM(DISTINCT n) FROM t").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows[0][0], Value::Integer(22)); // 5+5+7+5
+        assert_eq!(rows[0][1], Value::Integer(12)); // 5+7
+    }
+
+    #[test]
+    fn select_distinct_with_aggregate() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, city TEXT, n INT);
+            INSERT INTO t VALUES (1,'x',1),(2,'x',2),(3,'y',3);
+        ");
+        // After GROUP BY each (city) yields one row anyway. DISTINCT is
+        // a no-op but should still parse and execute.
+        let r = run(&mut e, "SELECT DISTINCT city FROM t GROUP BY city ORDER BY city").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

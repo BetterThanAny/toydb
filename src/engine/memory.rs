@@ -16,6 +16,16 @@ pub struct MemoryEngine {
     catalog: Catalog,
     data: HashMap<String, BTreeMap<RowId, Row>>,
     next_id: RowId,
+    /// Snapshot of `(catalog, data, next_id)` taken at `BEGIN`. On
+    /// `ROLLBACK` we restore from it; on `COMMIT` we discard it.
+    snapshot: Option<Snapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct Snapshot {
+    catalog: Catalog,
+    data: HashMap<String, BTreeMap<RowId, Row>>,
+    next_id: RowId,
 }
 
 impl MemoryEngine {
@@ -152,6 +162,40 @@ impl Engine for MemoryEngine {
         let _ = self.catalog.get(table)?;
         Ok(self.data.get(table).and_then(|m| m.get(&id).cloned()))
     }
+
+    fn begin(&mut self) -> Result<()> {
+        if self.snapshot.is_some() {
+            return Err(Error::other("nested transactions are not supported"));
+        }
+        self.snapshot = Some(Snapshot {
+            catalog: self.catalog.clone(),
+            data: self.data.clone(),
+            next_id: self.next_id,
+        });
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        if self.snapshot.is_none() {
+            return Err(Error::other("no transaction in progress"));
+        }
+        self.snapshot = None;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        match self.snapshot.take() {
+            None => Err(Error::other("no transaction in progress")),
+            Some(s) => {
+                self.catalog = s.catalog;
+                self.data = s.data;
+                self.next_id = s.next_id;
+                Ok(())
+            }
+        }
+    }
+
+    fn in_transaction(&self) -> bool { self.snapshot.is_some() }
 }
 
 #[cfg(test)]

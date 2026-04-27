@@ -1,18 +1,21 @@
 //! toydb REPL.
 //!
-//! Reads SQL one statement at a time, executes against an in-memory
-//! engine, and renders results in an ASCII grid. Multi-line input is
-//! supported by detecting whether the buffer ends in a complete statement
-//! (we just look for a trailing semicolon — far from bulletproof but it
-//! suits a teaching REPL).
+//! Usage:
+//!   toydb                    -- in-memory REPL
+//!   toydb --db path/to.db    -- disk-backed REPL (durable)
+//!   toydb file.sql           -- run script then exit (in-memory)
+//!   toydb --db x.db file.sql -- run script against disk DB
+//!
+//! Multi-line input ends at the first `;` on a line.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-use toydb::engine::MemoryEngine;
+use toydb::engine::{DiskEngine, Engine, MemoryEngine};
 use toydb::executor::Executor;
 use toydb::format::render;
 use toydb::sql::Parser;
@@ -27,22 +30,62 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut engine = MemoryEngine::new();
+struct Args {
+    db: Option<PathBuf>,
+    script: Option<PathBuf>,
+    help: bool,
+}
 
-    // Scripted mode: `toydb file.sql` runs the file and exits.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(path) = args.first() {
-        let sql = std::fs::read_to_string(path)?;
-        run_script(&mut engine, &sql);
+fn parse_args() -> Args {
+    let mut args = Args { db: None, script: None, help: false };
+    let mut iter = std::env::args().skip(1);
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--db" => {
+                args.db = iter.next().map(PathBuf::from);
+            }
+            "--help" | "-h" => args.help = true,
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag {other}");
+                std::process::exit(2);
+            }
+            other => {
+                args.script = Some(PathBuf::from(other));
+            }
+        }
+    }
+    args
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_args();
+    if args.help {
+        println!("toydb [--db FILE] [SCRIPT.sql]");
+        return Ok(());
+    }
+
+    let mut engine: Box<dyn Engine> = match args.db.clone() {
+        Some(path) => Box::new(DiskEngine::open(&path)?),
+        None => Box::new(MemoryEngine::new()),
+    };
+
+    if let Some(path) = args.script {
+        let sql = std::fs::read_to_string(&path)?;
+        run_script(engine.as_mut(), &sql);
+        // `engine` is dropped at end of scope; if it's a DiskEngine, the
+        // Drop impl flushes pending pages. The WAL is durable already.
         return Ok(());
     }
 
     let mut rl = DefaultEditor::new()?;
     rl.set_auto_add_history(true);
     let _ = rl.load_history(".toydb_history");
-
     println!("toydb REPL — type SQL, end with `;`. Ctrl-D to exit.");
+    if let Some(p) = &args.db {
+        println!("connected to {}", p.display());
+    } else {
+        println!("(in-memory; data is lost when you exit)");
+    }
     let mut buf = String::new();
     loop {
         let prompt = if buf.is_empty() { PROMPT } else { CONT_PROMPT };
@@ -56,7 +99,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let trimmed = line.trim();
         if buf.is_empty() {
-            // Meta commands. Only at the start of a fresh line.
+            if let Some(rest) = trimmed.strip_prefix(".schema") {
+                let name = rest.trim();
+                print_schema(engine.as_ref(), name);
+                continue;
+            }
             match trimmed {
                 ".exit" | ".quit" | "exit" | "quit" => break,
                 ".tables" => {
@@ -76,19 +123,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         buf.push_str(&line);
         buf.push('\n');
         if !buf.trim_end().ends_with(';') {
-            // Need more input — read another line under continuation prompt.
             continue;
         }
-        execute_buffer(&mut engine, &buf);
+        execute_buffer(engine.as_mut(), &buf);
         buf.clear();
     }
     let _ = rl.save_history(".toydb_history");
     Ok(())
 }
 
-use toydb::engine::Engine as _;
-
-fn execute_buffer(engine: &mut MemoryEngine, sql: &str) {
+fn execute_buffer(engine: &mut dyn Engine, sql: &str) {
     let stmts = match Parser::parse_all(sql) {
         Ok(v) => v,
         Err(e) => {
@@ -106,7 +150,7 @@ fn execute_buffer(engine: &mut MemoryEngine, sql: &str) {
     }
 }
 
-fn run_script(engine: &mut MemoryEngine, sql: &str) {
+fn run_script(engine: &mut dyn Engine, sql: &str) {
     let stmts = match Parser::parse_all(sql) {
         Ok(v) => v,
         Err(e) => {
@@ -127,9 +171,36 @@ fn run_script(engine: &mut MemoryEngine, sql: &str) {
 
 fn print_help() {
     println!("Meta commands:");
-    println!("  .tables   list tables in the catalog");
-    println!("  .help     show this help");
-    println!("  .exit     leave the REPL");
+    println!("  .tables          list tables in the catalog");
+    println!("  .schema [table]  show schema for a table (or all)");
+    println!("  .help            show this help");
+    println!("  .exit            leave the REPL");
     println!();
     println!("Statements end with a semicolon. Multi-line input is supported.");
+}
+
+fn print_schema(engine: &dyn Engine, name: &str) {
+    let names: Vec<String> = if name.is_empty() {
+        engine.list_tables()
+    } else {
+        vec![name.to_string()]
+    };
+    for n in names {
+        match engine.get_table(&n) {
+            Ok(t) => {
+                println!("CREATE TABLE {} (", t.name);
+                for (i, c) in t.columns.iter().enumerate() {
+                    let mut line = format!("    {} {}", c.name, c.ty);
+                    if c.primary_key { line.push_str(" PRIMARY KEY"); }
+                    if c.unique && !c.primary_key { line.push_str(" UNIQUE"); }
+                    if !c.nullable && !c.primary_key { line.push_str(" NOT NULL"); }
+                    if c.default.is_some() { line.push_str(" DEFAULT ..."); }
+                    if i + 1 < t.columns.len() { line.push(','); }
+                    println!("{line}");
+                }
+                println!(");");
+            }
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
 }

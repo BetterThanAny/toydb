@@ -34,6 +34,9 @@ pub struct AggSpec {
     /// `COUNT(*)` carries `Expression::Wildcard` so we know to count
     /// every input row (NULL or not).
     pub arg: Expression,
+    /// `true` for `COUNT(DISTINCT col)` etc. — the accumulator only
+    /// records each *unique* value once.
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,31 +85,32 @@ fn collect_inner(
     inside_agg: bool,
 ) -> Result<()> {
     match expr {
-        Expression::Function { name, args } if aggregate_kind(name).is_some() => {
+        Expression::Function { name, args, distinct } if aggregate_kind(name).is_some() => {
             if inside_agg {
                 return Err(Error::other("aggregates cannot be nested"));
             }
             let kind = aggregate_kind(name).expect("checked above");
-            // Validate arity here — every aggregate takes exactly one arg
-            // (with COUNT also accepting `*`).
             match (kind, args.len()) {
                 (AggKind::Count, 1) | (_, 1) => {}
                 (k, n) => {
                     return Err(Error::ty(format!("{} takes 1 argument, got {n}", k.name())));
                 }
             }
-            // For each argument, recurse to make sure no aggregates nested.
             for a in args {
                 collect_inner(a, out, true)?;
             }
             let arg = args[0].clone();
             let key = AggKey(expr.clone());
-            // Dedupe by structural equality.
             if !out.iter().any(|(k, _)| k.matches(expr)) {
-                out.push((key, AggSpec { kind, arg }));
+                out.push((key, AggSpec { kind, arg, distinct: *distinct }));
             }
         }
-        Expression::Function { args, .. } => {
+        Expression::Function { args, distinct, .. } => {
+            if *distinct {
+                return Err(Error::ty(
+                    "DISTINCT is only valid inside an aggregate function".to_string(),
+                ));
+            }
             for a in args {
                 collect_inner(a, out, inside_agg)?;
             }
@@ -132,6 +136,18 @@ fn collect_inner(
             collect_inner(expr, out, inside_agg)?;
             collect_inner(pattern, out, inside_agg)?;
         }
+        Expression::Case { operand, branches, otherwise } => {
+            if let Some(op) = operand {
+                collect_inner(op, out, inside_agg)?;
+            }
+            for (w, t) in branches {
+                collect_inner(w, out, inside_agg)?;
+                collect_inner(t, out, inside_agg)?;
+            }
+            if let Some(e) = otherwise {
+                collect_inner(e, out, inside_agg)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -145,9 +161,8 @@ fn collect_inner(
 #[derive(Debug, Clone)]
 pub struct Accumulator {
     kind: AggKind,
-    /// COUNT(*): always increments. COUNT(expr): increments on non-NULL.
-    /// SUM/AVG: running sum.
-    /// MIN/MAX: running extremum.
+    distinct: bool,
+    seen_values: std::collections::BTreeSet<GroupKey>,
     count: i64,
     sum_int: Option<i64>,
     sum_float: Option<f64>,
@@ -158,8 +173,14 @@ pub struct Accumulator {
 
 impl Accumulator {
     pub fn new(kind: AggKind) -> Self {
+        Self::new_with_distinct(kind, false)
+    }
+
+    pub fn new_with_distinct(kind: AggKind, distinct: bool) -> Self {
         Self {
             kind,
+            distinct,
+            seen_values: std::collections::BTreeSet::new(),
             count: 0,
             sum_int: Some(0),
             sum_float: None,
@@ -169,6 +190,17 @@ impl Accumulator {
     }
 
     pub fn update(&mut self, value: Value) -> Result<()> {
+        // For DISTINCT aggregates, drop duplicates (and NULL is implicitly
+        // excluded by the same path as non-distinct aggregates).
+        if self.distinct {
+            if value.is_null() {
+                return Ok(());
+            }
+            let key = GroupKey(vec![value.clone()]);
+            if !self.seen_values.insert(key) {
+                return Ok(());
+            }
+        }
         match self.kind {
             AggKind::Count => {
                 if !value.is_null() {
@@ -293,7 +325,9 @@ pub type Groups = BTreeMap<GroupKey, Vec<Accumulator>>;
 
 /// Build a starting accumulator vector matching `aggs`.
 pub fn fresh_accumulators(aggs: &[AggSpec]) -> Vec<Accumulator> {
-    aggs.iter().map(|a| Accumulator::new(a.kind)).collect()
+    aggs.iter()
+        .map(|a| Accumulator::new_with_distinct(a.kind, a.distinct))
+        .collect()
 }
 
 /// Update one group's accumulators with one input row.
@@ -416,14 +450,46 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
             let m = crate::executor::expr::like_match_for_test(&s, &pat);
             Ok(Value::Boolean(if *negated { !m } else { m }))
         }
-        Expression::Function { name, args } => {
-            // Non-aggregate function: evaluate args in group context, then
-            // hand off to the scalar evaluator.
+        Expression::Function { name, args, distinct } => {
             let new_args: Vec<Expression> = args
                 .iter()
                 .map(|a| eval_in_group(a, aggs, finals, outer).map(literal_to_expr))
                 .collect::<Result<_>>()?;
-            eval_with(&Expression::Function { name: name.clone(), args: new_args }, outer)
+            eval_with(
+                &Expression::Function { name: name.clone(), args: new_args, distinct: *distinct },
+                outer,
+            )
+        }
+        Expression::Case { operand, branches, otherwise } => {
+            match operand {
+                Some(op) => {
+                    let target = eval_in_group(op, aggs, finals, outer)?;
+                    for (when, then) in branches {
+                        let candidate = eval_in_group(when, aggs, finals, outer)?;
+                        if let Some(true) = target.equal_sql(&candidate)? {
+                            return eval_in_group(then, aggs, finals, outer);
+                        }
+                    }
+                }
+                None => {
+                    for (when, then) in branches {
+                        match eval_in_group(when, aggs, finals, outer)? {
+                            Value::Boolean(true) => {
+                                return eval_in_group(then, aggs, finals, outer);
+                            }
+                            Value::Boolean(false) | Value::Null => continue,
+                            other => return Err(Error::ty(format!(
+                                "CASE WHEN expects boolean, got {}",
+                                other.type_name()
+                            ))),
+                        }
+                    }
+                }
+            }
+            match otherwise {
+                Some(e) => eval_in_group(e, aggs, finals, outer),
+                None => Ok(Value::Null),
+            }
         }
     }
 }

@@ -26,6 +26,7 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Option<FromClause>,
     pub r#where: Option<Expression>,
@@ -158,10 +159,19 @@ pub enum Expression {
     /// `expr [NOT] LIKE pattern`.
     Like { expr: Box<Expression>, pattern: Box<Expression>, negated: bool },
     /// `f(arg, arg, ...)` — function call. We also model `COUNT(*)` here
-    /// using a single `Wildcard` arg.
-    Function { name: String, args: Vec<Expression> },
+    /// using a single `Wildcard` arg. `distinct` is set for
+    /// `COUNT(DISTINCT col)` and friends; ordinary calls leave it false.
+    Function { name: String, args: Vec<Expression>, distinct: bool },
     /// `*` inside a function call (specifically `COUNT(*)`).
     Wildcard,
+    /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`. With operand:
+    /// a "switch" form comparing against the operand. Without: a chain
+    /// of independent boolean conditions.
+    Case {
+        operand: Option<Box<Expression>>,
+        branches: Vec<(Expression, Expression)>,
+        otherwise: Option<Box<Expression>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
