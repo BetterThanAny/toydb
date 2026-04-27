@@ -199,12 +199,15 @@ mod tests {
     use crate::types::value::Value;
 
     fn tmppath() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("toydb-wal-{n}-{}.log", std::process::id()))
+        let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("toydb-wal-{n}-{c}-{}.log", std::process::id()))
     }
 
     fn make_table() -> Table {

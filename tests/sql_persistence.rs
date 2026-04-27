@@ -10,9 +10,12 @@ use toydb::sql::Parser;
 use toydb::types::value::Value;
 
 fn tmpdb() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    std::env::temp_dir().join(format!("toydb-it-{}-{n}.db", std::process::id()))
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("toydb-it-{}-{n}-{c}.db", std::process::id()))
 }
 
 fn cleanup(p: &std::path::Path) {

@@ -232,13 +232,16 @@ mod tests {
     use super::*;
 
     fn tmpfile() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
         let n = std::process::id();
-        let mut path = dir.join(format!("toydb-test-{n}-{}.db", rand_suffix()));
+        let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = dir.join(format!("toydb-test-{n}-{}-{c}.db", rand_suffix()));
         let mut i = 0;
         while path.exists() {
             i += 1;
-            path = dir.join(format!("toydb-test-{n}-{}-{i}.db", rand_suffix()));
+            path = dir.join(format!("toydb-test-{n}-{}-{c}-{i}.db", rand_suffix()));
         }
         path
     }

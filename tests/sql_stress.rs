@@ -84,9 +84,12 @@ fn memory_join_2k_x_2k() {
 
 #[test]
 fn disk_handles_2k_rows_round_trip() {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let path = std::env::temp_dir().join(format!("toydb-stress-{n}.db"));
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("toydb-stress-{n}-{c}.db"));
     {
         let mut e = DiskEngine::open(&path).unwrap();
         run_all(&mut e, "CREATE TABLE big (id INT PRIMARY KEY, n INT, s TEXT)");
