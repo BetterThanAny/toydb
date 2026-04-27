@@ -178,25 +178,25 @@ impl Engine for DiskEngine {
         Ok(id)
     }
 
-    fn scan(&self, table: &str) -> Result<Vec<(RowId, Row)>> {
+    fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>> {
         let _ = self.catalog.get(table)?;
         let head = *self
             .table_heads
             .get(table)
             .ok_or_else(|| Error::internal(format!("missing head for `{table}`")))?;
-        // We need &mut Pager to read pages but the trait method takes &self.
-        // The disk engine's pager.read_page caches pages; for safety we
-        // do a const cast via UnsafeCell ... no — simpler: use interior
-        // mutability later. For now we clone the pager state we need by
-        // reading bytes raw. Easier: change to take &mut self at the
-        // trait level? That breaks Engine. Compromise: use a stand-in
-        // mutable borrow trick by cloning the pager's path and doing a
-        // fresh open (but that's racy with WAL). Best: treat the engine
-        // as &mut self — the scan must clone everything anyway.
-        //
-        // Since the trait is &self, we route through a helper that reads
-        // pages from the file directly without the cache.
-        scan_via_pager(&self.pager, head)
+        let mut out = Vec::new();
+        let mut cur = head;
+        while cur != 0 {
+            let page = self.pager.read_page(cur)?;
+            for (slot, bytes) in page.iter() {
+                let id = make_row_id(cur, slot);
+                let mut s = bytes;
+                let row = decode_row(&mut s)?;
+                out.push((id, row));
+            }
+            cur = page.next_page();
+        }
+        Ok(out)
     }
 
     fn update(&mut self, table: &str, id: RowId, row: Row) -> Result<()> {
@@ -209,27 +209,36 @@ impl Engine for DiskEngine {
         encode_row(&row, &mut buf);
         match page.update(slot, &buf) {
             Ok(()) => {
+                // Fast path: in-place update. RowId stays valid.
                 self.pager.write_page(page_id, page)?;
+                self.wal.append(&LogRecord::Update {
+                    table: table.to_string(),
+                    id,
+                    row,
+                })?;
+                self.pager.flush()?;
+                Ok(())
             }
             Err(_) => {
-                // Couldn't update in place; the slot has been tombstoned
-                // already. Re-insert and remap by writing new RowId... but
-                // since we can't reallocate the same RowId, we'd have to
-                // change update semantics. For simplicity we keep the
-                // behaviour here: tombstone old, append new, update WAL
-                // with the new id. The caller's update map gets
-                // recomputed on the next scan.
+                // The new record didn't fit; `page::update` already
+                // tombstoned the original slot. Model this as a delete
+                // followed by an insert — both for the data file (the
+                // tombstone is the delete; `self.insert` performs the
+                // insert) and for the WAL. The original RowId is
+                // permanently invalid after this; callers that hold it
+                // must not look it up again. The current executor only
+                // consumes RowIds from a single scan so this is safe;
+                // documented in the trait's Engine::update doc.
                 self.pager.write_page(page_id, page)?;
-                let _new_id = self.insert(table, row.clone())?;
+                self.wal.append(&LogRecord::Delete {
+                    table: table.to_string(),
+                    id,
+                })?;
+                // self.insert appends its own Insert record and flushes.
+                self.insert(table, row)?;
+                Ok(())
             }
         }
-        self.wal.append(&LogRecord::Update {
-            table: table.to_string(),
-            id,
-            row,
-        })?;
-        self.pager.flush()?;
-        Ok(())
     }
 
     fn delete(&mut self, table: &str, id: RowId) -> Result<()> {
@@ -246,11 +255,10 @@ impl Engine for DiskEngine {
         Ok(())
     }
 
-    fn get(&self, table: &str, id: RowId) -> Result<Option<Row>> {
+    fn get(&mut self, table: &str, id: RowId) -> Result<Option<Row>> {
         let _ = self.catalog.get(table)?;
         let (page_id, slot) = split_row_id(id);
-        let mut p = Pager::open(self.pager.path())?;
-        let page = p.read_page(page_id)?;
+        let page = self.pager.read_page(page_id)?;
         match page.get(slot) {
             None => Ok(None),
             Some(bytes) => {
@@ -332,25 +340,6 @@ fn check_unique_disk(
     Ok(())
 }
 
-fn scan_via_pager(pager: &Pager, head: PageId) -> Result<Vec<(RowId, Row)>> {
-    // Read pages by reopening the file (we can't take &mut from an &self
-    // borrow). This is fine for a teaching impl — we read fresh bytes
-    // directly without using the cache.
-    let mut p = Pager::open(pager.path())?;
-    let mut out = Vec::new();
-    let mut cur = head;
-    while cur != 0 {
-        let page = p.read_page(cur)?;
-        for (slot, bytes) in page.iter() {
-            let id = make_row_id(cur, slot);
-            let mut s = bytes;
-            let row = decode_row(&mut s)?;
-            out.push((id, row));
-        }
-        cur = page.next_page();
-    }
-    Ok(out)
-}
 
 // ---------------------------------------------------------------------
 // Catalog encoding (linked list of catalog pages)
@@ -480,23 +469,53 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 catalog.drop_table(name)?;
                 heads.remove(name);
             }
-            LogRecord::Insert { table: _, id, row } | LogRecord::Update { table: _, id, row } => {
+            LogRecord::Insert { table, id, row } => {
+                if !catalog.contains(table) {
+                    // Table was dropped later in the WAL; the
+                    // subsequent DropTable record will free its pages.
+                    continue;
+                }
+                let (page_id, expected_slot) = split_row_id(*id);
+                let mut buf = Vec::new();
+                encode_row(row, &mut buf);
+                let mut page = pager.read_page(page_id)?;
+                // Idempotent replay: this record has already been applied
+                // if the slot already holds the same bytes (the common
+                // case is that the prior `Drop` impl flushed pages but
+                // didn't truncate the WAL). Skip rather than reinsert.
+                if page.get(expected_slot) == Some(buf.as_slice()) {
+                    continue;
+                }
+                let actual = page.insert(&buf)?;
+                if actual != expected_slot {
+                    return Err(Error::other(format!(
+                        "WAL replay: insert slot mismatch — log says \
+                         (page={page_id}, slot={expected_slot}), \
+                         page allocator returned slot {actual}"
+                    )));
+                }
+                pager.write_page(page_id, page)?;
+            }
+            LogRecord::Update { table, id, row } => {
+                if !catalog.contains(table) { continue; }
                 let (page_id, slot) = split_row_id(*id);
                 let mut buf = Vec::new();
                 encode_row(row, &mut buf);
                 let mut page = pager.read_page(page_id)?;
-                if (slot as u32) < page.slot_count() {
-                    let _ = page.update(slot, &buf);
-                } else {
-                    let _ = page.insert(&buf);
+                if page.get(slot) == Some(buf.as_slice()) {
+                    continue; // already applied
                 }
+                page.update(slot, &buf)?;
                 pager.write_page(page_id, page)?;
             }
             LogRecord::Delete { table, id } => {
-                let _ = table;
+                if !catalog.contains(table) { continue; }
                 let (page_id, slot) = split_row_id(*id);
                 let mut page = pager.read_page(page_id)?;
-                let _ = page.delete(slot);
+                if page.get(slot).is_none() {
+                    continue; // already tombstoned
+                }
+                page.delete(slot)?;
                 pager.write_page(page_id, page)?;
             }
         }
@@ -562,7 +581,7 @@ mod tests {
             e.checkpoint().unwrap();
         }
         {
-            let e = DiskEngine::open(&path).unwrap();
+            let mut e = DiskEngine::open(&path).unwrap();
             let rows = e.scan("users").unwrap();
             assert_eq!(rows.len(), 2);
         }
@@ -584,7 +603,7 @@ mod tests {
             id
         };
         {
-            let e = DiskEngine::open(&path).unwrap();
+            let mut e = DiskEngine::open(&path).unwrap();
             let v = e.get("users", id).unwrap().unwrap();
             assert_eq!(v[1], Value::String("ALICE".into()));
         }
@@ -594,7 +613,7 @@ mod tests {
             e.checkpoint().unwrap();
         }
         {
-            let e = DiskEngine::open(&path).unwrap();
+            let mut e = DiskEngine::open(&path).unwrap();
             assert!(e.scan("users").unwrap().is_empty());
         }
         cleanup(&path);
@@ -645,7 +664,7 @@ mod tests {
             // no-op here because we already flushed pages through `insert`.
         }
         {
-            let e = DiskEngine::open(&path).unwrap();
+            let mut e = DiskEngine::open(&path).unwrap();
             let rows = e.scan("users").unwrap();
             assert_eq!(rows.len(), 2);
         }
@@ -668,7 +687,7 @@ mod tests {
             e.checkpoint().unwrap();
         }
         {
-            let e = DiskEngine::open(&path).unwrap();
+            let mut e = DiskEngine::open(&path).unwrap();
             assert_eq!(e.scan("t").unwrap().len(), 50);
         }
         cleanup(&path);

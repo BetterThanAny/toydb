@@ -30,10 +30,17 @@ pub trait Engine {
 
     // -- DML -----------------------------------------------------------
     fn insert(&mut self, table: &str, row: Row) -> Result<RowId>;
-    fn scan(&self, table: &str) -> Result<Vec<(RowId, Row)>>;
+    fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>>;
+    /// Replace the row at `id`. The returned `Result<()>` does **not**
+    /// guarantee the RowId stays valid: a backend that has to relocate
+    /// the row (because the new bytes don't fit in the original slot)
+    /// is allowed to invalidate `id` and emit a fresh row internally.
+    /// Callers that need stable identity should use the engine's
+    /// constraint mechanisms (e.g. PRIMARY KEY) instead of holding
+    /// RowIds across `update` calls.
     fn update(&mut self, table: &str, id: RowId, row: Row) -> Result<()>;
     fn delete(&mut self, table: &str, id: RowId) -> Result<()>;
-    fn get(&self, table: &str, id: RowId) -> Result<Option<Row>>;
+    fn get(&mut self, table: &str, id: RowId) -> Result<Option<Row>>;
 
     // -- Transactions --------------------------------------------------
     //

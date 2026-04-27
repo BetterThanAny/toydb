@@ -122,7 +122,7 @@ impl Engine for MemoryEngine {
         Ok(id)
     }
 
-    fn scan(&self, table: &str) -> Result<Vec<(RowId, Row)>> {
+    fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>> {
         let _ = self.catalog.get(table)?;
         Ok(self
             .data
@@ -158,7 +158,7 @@ impl Engine for MemoryEngine {
         Ok(())
     }
 
-    fn get(&self, table: &str, id: RowId) -> Result<Option<Row>> {
+    fn get(&mut self, table: &str, id: RowId) -> Result<Option<Row>> {
         let _ = self.catalog.get(table)?;
         Ok(self.data.get(table).and_then(|m| m.get(&id).cloned()))
     }

@@ -130,9 +130,8 @@ impl Page {
     pub fn insert(&mut self, data: &[u8]) -> Result<u16> {
         // Try to reuse a tombstone slot first.
         for i in 0..self.slot_count() {
-            let (off, len) = self.slot(i as usize);
+            let (_, len) = self.slot(i as usize);
             if len == 0 && self.free_space_for_existing_slot() >= data.len() {
-                let _ = off;
                 return self.write_into_slot(i as usize, data);
             }
         }

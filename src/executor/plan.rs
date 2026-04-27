@@ -368,11 +368,19 @@ impl<'a> Executor<'a> {
         let mut head = s.clone();
         head.unions.clear();
         let head_rs = self.exec_select_inner(&head)?;
-        let (mut columns, mut rows) = match head_rs {
+        let (columns, mut rows) = match head_rs {
             ResultSet::Select { columns, rows } => (columns, rows),
             _ => return Err(Error::internal("UNION head did not return Select")),
         };
-        // `dedupe` becomes true the moment we encounter any non-ALL UNION.
+        // Track per-column types from the head + every UNION arm. NULL
+        // is compatible with anything; numeric columns may mix Integer
+        // and Float (one promotes to the other), but mixing types like
+        // String + Integer is rejected.
+        let mut col_types: Vec<Option<crate::sql::ast::DataType>> =
+            vec![None; columns.len()];
+        for r in &rows {
+            update_union_types(&mut col_types, r)?;
+        }
         let mut dedupe = false;
         for u in &s.unions {
             let mut sub = (*u.query).clone();
@@ -392,6 +400,9 @@ impl<'a> Executor<'a> {
                     sub_cols.len()
                 )));
             }
+            for r in &sub_rows {
+                update_union_types(&mut col_types, r)?;
+            }
             rows.extend(sub_rows);
             if !u.all {
                 dedupe = true;
@@ -408,15 +419,14 @@ impl<'a> Executor<'a> {
             }
             rows = out;
         }
-        let _ = &mut columns;
         Ok(ResultSet::Select { columns, rows })
     }
 
     fn exec_select_inner(&mut self, s: &SelectStmt) -> Result<ResultSet> {
         // Constant query: no FROM.
-        let Some(_) = s.from.as_ref() else {
+        if s.from.is_none() {
             return self.exec_const_select(s);
-        };
+        }
 
         // Materialise the FROM clause into a wide row set.
         let materialised = self.build_source(s.from.as_ref().unwrap())?;
@@ -564,8 +574,8 @@ impl<'a> Executor<'a> {
                 collect_aggregates(expr, &mut local)?;
                 if local.is_empty() && !s.group_by.iter().any(|g| g == expr) && !is_constant(expr) {
                     return Err(Error::other(format!(
-                        "non-aggregate item `{:?}` is not in GROUP BY",
-                        expr
+                        "non-aggregate item {} is not in GROUP BY",
+                        describe_expr(expr)
                     )));
                 }
             }
@@ -1034,33 +1044,12 @@ fn nested_loop_join(
     let left_arity = left.schema.columns.len();
 
     let mut output: Vec<Row> = Vec::new();
-    match kind {
-        JoinKind::Inner | JoinKind::Left | JoinKind::Right => {}
-    }
-
     let outer_first = matches!(kind, JoinKind::Left | JoinKind::Inner);
-    let (outer_rows, inner_rows, outer_schema, inner_schema, outer_arity, inner_arity, swap) =
-        if outer_first {
-            (
-                &left.rows,
-                &right.rows,
-                &left.schema,
-                &right.schema,
-                left_arity,
-                right_arity,
-                false,
-            )
-        } else {
-            (
-                &right.rows,
-                &left.rows,
-                &right.schema,
-                &left.schema,
-                right_arity,
-                left_arity,
-                true,
-            )
-        };
+    let (outer_rows, inner_rows, outer_arity, inner_arity, swap) = if outer_first {
+        (&left.rows, &right.rows, left_arity, right_arity, false)
+    } else {
+        (&right.rows, &left.rows, right_arity, left_arity, true)
+    };
 
     let preserve_outer = matches!(kind, JoinKind::Left | JoinKind::Right);
 
@@ -1104,7 +1093,6 @@ fn nested_loop_join(
             output.push(Row(wide));
         }
     }
-    let _ = outer_schema; let _ = inner_schema;
     Ok((combined_schema, output))
 }
 
@@ -1222,6 +1210,39 @@ fn limit_eval(expr: &Option<Expression>, label: &str) -> Result<usize> {
     }
 }
 
+/// Update per-column type tracking for UNION compatibility. Returns
+/// `Err` if a row introduces an incompatible type for any column.
+/// Compatibility rules:
+/// - NULL is compatible with anything.
+/// - INTEGER and FLOAT are compatible (numeric promotion).
+/// - Otherwise the types must match exactly.
+fn update_union_types(
+    state: &mut [Option<crate::sql::ast::DataType>],
+    row: &Row,
+) -> Result<()> {
+    use crate::sql::ast::DataType;
+    for (i, v) in row.0.iter().enumerate() {
+        let Some(ty) = v.datatype() else { continue }; // NULL — accept any
+        match state[i] {
+            None => state[i] = Some(ty),
+            Some(prev) if prev == ty => {}
+            Some(DataType::Integer) if ty == DataType::Float => {
+                state[i] = Some(DataType::Float);
+            }
+            Some(DataType::Float) if ty == DataType::Integer => {} // already float
+            Some(prev) => {
+                return Err(Error::ty(format!(
+                    "UNION column {} is {} but a later arm produced {}",
+                    i + 1,
+                    prev,
+                    ty
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn literal_for_value(v: Value) -> crate::sql::ast::Literal {
     use crate::sql::ast::Literal;
     match v {
@@ -1230,6 +1251,27 @@ fn literal_for_value(v: Value) -> crate::sql::ast::Literal {
         Value::Integer(n) => Literal::Integer(n),
         Value::Float(f) => Literal::Float(f),
         Value::String(s) => Literal::String(s),
+    }
+}
+
+/// Compact, human-readable rendering of an `Expression` for error
+/// messages. Doesn't reconstruct the source SQL; just gives enough
+/// context for the user to find the offending item.
+fn describe_expr(e: &Expression) -> String {
+    match e {
+        Expression::Column(c) => format!("column `{c}`"),
+        Expression::Qualified(t, c) => format!("column `{t}.{c}`"),
+        Expression::Literal(_) => "literal".into(),
+        Expression::Function { name, .. } => format!("`{}(…)`", name),
+        Expression::Wildcard => "`*`".into(),
+        Expression::Unary(op, _) => format!("unary `{op:?}` expression"),
+        Expression::Binary(_, op, _) => format!("`{}` expression", op.symbol()),
+        Expression::IsNull { .. } => "`IS NULL` predicate".into(),
+        Expression::InList { .. } => "`IN (...)` predicate".into(),
+        Expression::Between { .. } => "`BETWEEN` predicate".into(),
+        Expression::Like { .. } => "`LIKE` predicate".into(),
+        Expression::Case { .. } => "`CASE` expression".into(),
+        Expression::Scalar(_) => "scalar subquery".into(),
     }
 }
 
@@ -1688,6 +1730,47 @@ mod tests {
         let r = run(&mut e, "SELECT x FROM a UNION SELECT y FROM b").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn union_type_mismatch_errors() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE a (x INT PRIMARY KEY);
+            CREATE TABLE b (y TEXT PRIMARY KEY);
+            INSERT INTO a VALUES (1);
+            INSERT INTO b VALUES ('hello');
+        ");
+        let r = try_run(&mut e, "SELECT x FROM a UNION SELECT y FROM b");
+        assert!(r.is_err(), "expected type mismatch, got {r:?}");
+        assert!(r.unwrap_err().to_string().contains("UNION column"));
+    }
+
+    #[test]
+    fn union_int_float_compatible() {
+        // INT and FLOAT are compatible — INT gets promoted.
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE a (x INT PRIMARY KEY);
+            CREATE TABLE b (y FLOAT PRIMARY KEY);
+            INSERT INTO a VALUES (1);
+            INSERT INTO b VALUES (2.5);
+        ");
+        let r = run(&mut e, "SELECT x FROM a UNION ALL SELECT y FROM b").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn union_with_null_columns_ok() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE a (x INT PRIMARY KEY, n INT);
+            INSERT INTO a VALUES (1, NULL), (2, 5);
+        ");
+        let r = run(&mut e, "SELECT n FROM a UNION ALL SELECT n FROM a").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]
