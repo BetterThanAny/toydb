@@ -738,6 +738,12 @@ impl Parser {
             }
             Token::LParen => {
                 self.bump();
+                // Scalar subquery: `(SELECT ...)`
+                if matches!(self.peek_tok(), Some(Token::KwSelect)) {
+                    let inner = self.parse_select()?;
+                    self.expect(Token::RParen)?;
+                    return Ok(Expression::Scalar(Box::new(inner)));
+                }
                 let e = self.parse_expression()?;
                 self.expect(Token::RParen)?;
                 Ok(e)

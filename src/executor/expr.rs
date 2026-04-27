@@ -159,6 +159,9 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
             }
             apply_function(name, args, r)
         }
+        Expression::Scalar(_) => Err(Error::internal(
+            "scalar subqueries must be resolved before eval (executor bug)",
+        )),
         Expression::Case { operand, branches, otherwise } => {
             // Switch form evaluates `operand` once and compares it against
             // each WHEN expression with SQL equality (NULL never matches).

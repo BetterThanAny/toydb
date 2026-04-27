@@ -35,8 +35,14 @@ impl<'a> Executor<'a> {
     pub fn new(engine: &'a mut dyn Engine) -> Self { Self { engine } }
 
     /// Run one statement against the engine.
+    ///
+    /// Before dispatch we resolve any scalar subqueries in the statement
+    /// (uncorrelated only) by running them and folding the result down
+    /// to a literal. This keeps the rest of the pipeline subquery-free.
     pub fn execute(&mut self, stmt: &Statement) -> Result<ResultSet> {
-        match stmt {
+        let mut stmt = stmt.clone();
+        self.resolve_subqueries_stmt(&mut stmt)?;
+        match &stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::DropTable(s) => self.exec_drop_table(s),
             Statement::AlterTable(s) => self.exec_alter_table(s),
@@ -57,6 +63,157 @@ impl<'a> Executor<'a> {
                 Ok(ResultSet::Rollback)
             }
             Statement::Explain(inner) => Ok(ResultSet::Explain(describe_plan(inner))),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Scalar subquery resolution
+    // ------------------------------------------------------------------
+
+    fn resolve_subqueries_stmt(&mut self, stmt: &mut Statement) -> Result<()> {
+        match stmt {
+            Statement::Select(s) => self.resolve_subqueries_select(s),
+            Statement::Insert(i) => {
+                if let InsertSource::Values(rows) = &mut i.source {
+                    for row in rows {
+                        for e in row.iter_mut() {
+                            self.resolve_subqueries_expr(e)?;
+                        }
+                    }
+                }
+                if let InsertSource::Select(inner) = &mut i.source {
+                    self.resolve_subqueries_select(inner)?;
+                }
+                Ok(())
+            }
+            Statement::Update(u) => {
+                for (_, e) in u.assignments.iter_mut() {
+                    self.resolve_subqueries_expr(e)?;
+                }
+                if let Some(w) = u.r#where.as_mut() {
+                    self.resolve_subqueries_expr(w)?;
+                }
+                Ok(())
+            }
+            Statement::Delete(d) => {
+                if let Some(w) = d.r#where.as_mut() {
+                    self.resolve_subqueries_expr(w)?;
+                }
+                Ok(())
+            }
+            Statement::Explain(inner) => self.resolve_subqueries_stmt(inner),
+            Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::AlterTable(_)
+            | Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback => Ok(()),
+        }
+    }
+
+    fn resolve_subqueries_select(&mut self, s: &mut SelectStmt) -> Result<()> {
+        for item in &mut s.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.resolve_subqueries_expr(expr)?;
+            }
+        }
+        if let Some(w) = s.r#where.as_mut() {
+            self.resolve_subqueries_expr(w)?;
+        }
+        for g in &mut s.group_by {
+            self.resolve_subqueries_expr(g)?;
+        }
+        if let Some(h) = s.having.as_mut() {
+            self.resolve_subqueries_expr(h)?;
+        }
+        for ob in &mut s.order_by {
+            self.resolve_subqueries_expr(&mut ob.expr)?;
+        }
+        if let Some(l) = s.limit.as_mut() {
+            self.resolve_subqueries_expr(l)?;
+        }
+        if let Some(o) = s.offset.as_mut() {
+            self.resolve_subqueries_expr(o)?;
+        }
+        Ok(())
+    }
+
+    fn resolve_subqueries_expr(&mut self, e: &mut Expression) -> Result<()> {
+        // Replace Scalar(stmt) with a literal value, recurse into kids.
+        if let Expression::Scalar(inner) = e {
+            // Recursively resolve nested subqueries.
+            self.resolve_subqueries_select(inner)?;
+            let value = self.run_scalar_subquery(inner)?;
+            *e = Expression::Literal(literal_for_value(value));
+            return Ok(());
+        }
+        match e {
+            Expression::Literal(_)
+            | Expression::Column(_)
+            | Expression::Qualified(_, _)
+            | Expression::Wildcard => {}
+            Expression::Unary(_, inner) => self.resolve_subqueries_expr(inner)?,
+            Expression::Binary(l, _, r) => {
+                self.resolve_subqueries_expr(l)?;
+                self.resolve_subqueries_expr(r)?;
+            }
+            Expression::IsNull { expr, .. } => self.resolve_subqueries_expr(expr)?,
+            Expression::InList { expr, list, .. } => {
+                self.resolve_subqueries_expr(expr)?;
+                for it in list {
+                    self.resolve_subqueries_expr(it)?;
+                }
+            }
+            Expression::Between { expr, low, high, .. } => {
+                self.resolve_subqueries_expr(expr)?;
+                self.resolve_subqueries_expr(low)?;
+                self.resolve_subqueries_expr(high)?;
+            }
+            Expression::Like { expr, pattern, .. } => {
+                self.resolve_subqueries_expr(expr)?;
+                self.resolve_subqueries_expr(pattern)?;
+            }
+            Expression::Function { args, .. } => {
+                for a in args {
+                    self.resolve_subqueries_expr(a)?;
+                }
+            }
+            Expression::Case { operand, branches, otherwise } => {
+                if let Some(op) = operand.as_mut() {
+                    self.resolve_subqueries_expr(op)?;
+                }
+                for (w, t) in branches {
+                    self.resolve_subqueries_expr(w)?;
+                    self.resolve_subqueries_expr(t)?;
+                }
+                if let Some(o) = otherwise.as_mut() {
+                    self.resolve_subqueries_expr(o)?;
+                }
+            }
+            Expression::Scalar(_) => unreachable!("handled above"),
+        }
+        Ok(())
+    }
+
+    fn run_scalar_subquery(&mut self, s: &SelectStmt) -> Result<Value> {
+        let rs = self.exec_select(s)?;
+        match rs {
+            ResultSet::Select { rows, columns } => {
+                if columns.len() != 1 {
+                    return Err(Error::other(format!(
+                        "scalar subquery returned {} columns, expected 1",
+                        columns.len()
+                    )));
+                }
+                match rows.len() {
+                    0 => Ok(Value::Null),
+                    1 => Ok(rows.into_iter().next().unwrap().0.into_iter().next().unwrap()),
+                    n => Err(Error::other(format!(
+                        "scalar subquery returned {n} rows, expected 0 or 1"
+                    ))),
+                }
+            }
+            _ => Err(Error::internal("inner SELECT did not return rows")),
         }
     }
 
@@ -272,10 +429,28 @@ impl<'a> Executor<'a> {
         // Build the projection plan once.
         let (columns, plan) = build_wide_projection(&s.items, schema)?;
 
-        // Sort + LIMIT.
+        // Sort + LIMIT. ORDER BY may reference SELECT aliases (Postgres
+        // semantics) — rewrite those before sorting.
+        let select_aliases: HashMap<&str, &Expression> = s
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::Expr { expr, alias: Some(a) } => Some((a.as_str(), expr)),
+                _ => None,
+            })
+            .collect();
+        let order_by: Vec<OrderBy> = s
+            .order_by
+            .iter()
+            .map(|ob| OrderBy {
+                expr: rewrite_aliases(&ob.expr, &select_aliases),
+                asc: ob.asc,
+                nulls_first: ob.nulls_first,
+            })
+            .collect();
         let mut rows = rows;
-        if !s.order_by.is_empty() {
-            sort_rows_wide(&mut rows, &s.order_by, schema)?;
+        if !order_by.is_empty() {
+            sort_rows_wide(&mut rows, &order_by, schema)?;
         }
         let offset = limit_eval(&s.offset, "OFFSET")?;
         let limit = limit_eval(&s.limit, "LIMIT")?;
@@ -980,6 +1155,17 @@ fn limit_eval(expr: &Option<Expression>, label: &str) -> Result<usize> {
     }
 }
 
+fn literal_for_value(v: Value) -> crate::sql::ast::Literal {
+    use crate::sql::ast::Literal;
+    match v {
+        Value::Null => Literal::Null,
+        Value::Boolean(b) => Literal::Boolean(b),
+        Value::Integer(n) => Literal::Integer(n),
+        Value::Float(f) => Literal::Float(f),
+        Value::String(s) => Literal::String(s),
+    }
+}
+
 fn is_constant(e: &Expression) -> bool {
     match e {
         Expression::Literal(_) => true,
@@ -1002,7 +1188,7 @@ fn rewrite_aliases(expr: &Expression, aliases: &HashMap<&str, &Expression>) -> E
             }
         }
         Expression::Qualified(_, _) => expr.clone(),
-        Expression::Literal(_) | Expression::Wildcard => expr.clone(),
+        Expression::Literal(_) | Expression::Wildcard | Expression::Scalar(_) => expr.clone(),
         Expression::Unary(op, inner) => {
             Expression::Unary(*op, Box::new(rewrite_aliases(inner, aliases)))
         }

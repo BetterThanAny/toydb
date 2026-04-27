@@ -194,6 +194,10 @@ pub enum Expression {
         branches: Vec<(Expression, Expression)>,
         otherwise: Option<Box<Expression>>,
     },
+    /// `(SELECT ...)` returning a single column, a single row — the
+    /// evaluator unwraps it to a scalar [`Value`]. Multiple rows or
+    /// columns are runtime errors.
+    Scalar(Box<SelectStmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

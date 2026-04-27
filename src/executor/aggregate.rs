@@ -148,6 +148,10 @@ fn collect_inner(
                 collect_inner(e, out, inside_agg)?;
             }
         }
+        Expression::Scalar(_) => {
+            // Scalar subqueries are resolved before aggregation; nothing
+            // to recurse into here.
+        }
         _ => {}
     }
     Ok(())
@@ -460,6 +464,9 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
                 outer,
             )
         }
+        Expression::Scalar(_) => Err(Error::internal(
+            "scalar subqueries must be resolved before eval_in_group (executor bug)",
+        )),
         Expression::Case { operand, branches, otherwise } => {
             match operand {
                 Some(op) => {
