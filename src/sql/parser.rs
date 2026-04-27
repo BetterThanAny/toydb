@@ -117,6 +117,26 @@ impl Parser {
     // ------------------------------------------------------------------
 
     fn parse_select(&mut self) -> Result<SelectStmt> {
+        // Parse the first SELECT *core* (no ORDER BY / LIMIT / OFFSET yet).
+        let mut head = self.parse_select_core()?;
+        // Stitch together any UNION clauses.
+        let mut unions = Vec::new();
+        while self.consume_if(&Token::KwUnion) {
+            let all = self.consume_if(&Token::KwAll);
+            let next = self.parse_select_core()?;
+            unions.push(UnionPart { all, query: Box::new(next) });
+        }
+        // ORDER BY / LIMIT / OFFSET apply to the *combined* result.
+        let (order_by, limit, offset) = self.parse_order_limit_offset()?;
+        head.order_by = order_by;
+        head.limit = limit;
+        head.offset = offset;
+        head.unions = unions;
+        Ok(head)
+    }
+
+    /// Parse one SELECT without trailing ORDER BY / LIMIT / OFFSET.
+    fn parse_select_core(&mut self) -> Result<SelectStmt> {
         self.expect(Token::KwSelect)?;
         let distinct = self.consume_if(&Token::KwDistinct);
 
@@ -157,6 +177,23 @@ impl Parser {
             None
         };
 
+        Ok(SelectStmt {
+            distinct,
+            items,
+            from,
+            r#where,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        })
+    }
+
+    fn parse_order_limit_offset(
+        &mut self,
+    ) -> Result<(Vec<OrderBy>, Option<Expression>, Option<Expression>)> {
         let mut order_by = Vec::new();
         if self.consume_if(&Token::KwOrder) {
             self.expect(Token::KwBy)?;
@@ -173,8 +210,6 @@ impl Parser {
                     }
                     _ => true,
                 };
-                // NULLS FIRST | NULLS LAST. Default mirrors Postgres:
-                // ASC → LAST, DESC → FIRST.
                 let nulls_first = if self.consume_if(&Token::KwNulls) {
                     match self.peek_tok() {
                         Some(Token::KwFirst) => { self.bump(); true }
@@ -190,20 +225,17 @@ impl Parser {
                 }
             }
         }
-
         let limit = if self.consume_if(&Token::KwLimit) {
             Some(self.parse_expression()?)
         } else {
             None
         };
-
         let offset = if self.consume_if(&Token::KwOffset) {
             Some(self.parse_expression()?)
         } else {
             None
         };
-
-        Ok(SelectStmt { distinct, items, from, r#where, group_by, having, order_by, limit, offset })
+        Ok((order_by, limit, offset))
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {

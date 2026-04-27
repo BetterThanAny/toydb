@@ -103,6 +103,8 @@ pub enum Token {
     KwAlter,
     KwAdd,
     KwColumn,
+    KwUnion,
+    KwAll,
 
     // -- punctuation -----------------------------------------------------
     Comma,
@@ -233,6 +235,8 @@ fn keyword(upper: &str) -> Option<Token> {
         "ALTER" => KwAlter,
         "ADD" => KwAdd,
         "COLUMN" => KwColumn,
+        "UNION" => KwUnion,
+        "ALL" => KwAll,
         _ => return None,
     })
 }

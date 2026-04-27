@@ -47,6 +47,16 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<Expression>,
     pub offset: Option<Expression>,
+    /// Additional `UNION [ALL]` queries appended to this one. The
+    /// `order_by` / `limit` / `offset` apply to the *combined* result.
+    pub unions: Vec<UnionPart>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionPart {
+    /// `true` for `UNION ALL` (no dedup), `false` for `UNION` (dedup).
+    pub all: bool,
+    pub query: Box<SelectStmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

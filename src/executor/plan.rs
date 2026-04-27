@@ -135,6 +135,9 @@ impl<'a> Executor<'a> {
         if let Some(o) = s.offset.as_mut() {
             self.resolve_subqueries_expr(o)?;
         }
+        for u in &mut s.unions {
+            self.resolve_subqueries_select(&mut u.query)?;
+        }
         Ok(())
     }
 
@@ -346,6 +349,70 @@ impl<'a> Executor<'a> {
     // ------------------------------------------------------------------
 
     fn exec_select(&mut self, s: &SelectStmt) -> Result<ResultSet> {
+        if !s.unions.is_empty() {
+            return self.exec_union(s);
+        }
+        self.exec_select_inner(s)
+    }
+
+    fn exec_union(&mut self, s: &SelectStmt) -> Result<ResultSet> {
+        // We don't yet support sort/limit/offset on top of a UNION
+        // because they'd need a column-name resolver over the combined
+        // result set. Reject up front so the user gets a clear error.
+        if !s.order_by.is_empty() || s.limit.is_some() || s.offset.is_some() {
+            return Err(Error::other(
+                "ORDER BY / LIMIT / OFFSET on a UNION'ed result is not supported yet",
+            ));
+        }
+        // Run the head as if it had no unions.
+        let mut head = s.clone();
+        head.unions.clear();
+        let head_rs = self.exec_select_inner(&head)?;
+        let (mut columns, mut rows) = match head_rs {
+            ResultSet::Select { columns, rows } => (columns, rows),
+            _ => return Err(Error::internal("UNION head did not return Select")),
+        };
+        // `dedupe` becomes true the moment we encounter any non-ALL UNION.
+        let mut dedupe = false;
+        for u in &s.unions {
+            let mut sub = (*u.query).clone();
+            sub.unions.clear();
+            sub.order_by.clear();
+            sub.limit = None;
+            sub.offset = None;
+            let rs = self.exec_select_inner(&sub)?;
+            let (sub_cols, sub_rows) = match rs {
+                ResultSet::Select { columns, rows } => (columns, rows),
+                _ => return Err(Error::internal("UNION arm did not return Select")),
+            };
+            if sub_cols.len() != columns.len() {
+                return Err(Error::other(format!(
+                    "UNION column count mismatch ({} vs {})",
+                    columns.len(),
+                    sub_cols.len()
+                )));
+            }
+            rows.extend(sub_rows);
+            if !u.all {
+                dedupe = true;
+            }
+        }
+        if dedupe {
+            let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                let key = GroupKey(r.0.clone());
+                if seen.insert(key) {
+                    out.push(r);
+                }
+            }
+            rows = out;
+        }
+        let _ = &mut columns;
+        Ok(ResultSet::Select { columns, rows })
+    }
+
+    fn exec_select_inner(&mut self, s: &SelectStmt) -> Result<ResultSet> {
         // Constant query: no FROM.
         let Some(_) = s.from.as_ref() else {
             return self.exec_const_select(s);
@@ -1585,6 +1652,49 @@ mod tests {
     // ----- DISTINCT ---------------------------------------------------
 
     // ----- NULLS FIRST/LAST -------------------------------------------
+
+    // ----- UNION / UNION ALL -----------------------------------------
+
+    #[test]
+    fn union_all_keeps_duplicates() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE a (x INT PRIMARY KEY);
+            CREATE TABLE b (y INT PRIMARY KEY);
+            INSERT INTO a VALUES (1),(2),(3);
+            INSERT INTO b VALUES (3),(4),(5);
+        ");
+        let r = run(&mut e, "SELECT x FROM a UNION ALL SELECT y FROM b").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 6);
+    }
+
+    #[test]
+    fn union_dedupes() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE a (x INT PRIMARY KEY);
+            CREATE TABLE b (y INT PRIMARY KEY);
+            INSERT INTO a VALUES (1),(2),(3);
+            INSERT INTO b VALUES (3),(4),(5);
+        ");
+        let r = run(&mut e, "SELECT x FROM a UNION SELECT y FROM b").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn union_column_count_mismatch_errors() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE a (x INT PRIMARY KEY, y INT);
+            CREATE TABLE b (z INT PRIMARY KEY);
+            INSERT INTO a VALUES (1, 2);
+            INSERT INTO b VALUES (3);
+        ");
+        let r = try_run(&mut e, "SELECT x, y FROM a UNION SELECT z FROM b");
+        assert!(r.is_err());
+    }
 
     // ----- Scalar subqueries -----------------------------------------
 

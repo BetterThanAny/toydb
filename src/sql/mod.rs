@@ -7,7 +7,7 @@ pub mod parser;
 pub use ast::{
     AlterAction, AlterTableStmt, BinaryOp, ColumnDef, CreateTableStmt, DataType, DeleteStmt,
     DropTableStmt, Expression, FromClause, InsertSource, InsertStmt, JoinKind, Literal, OrderBy,
-    SelectItem, SelectStmt, Statement, UnaryOp, UpdateStmt,
+    SelectItem, SelectStmt, Statement, UnaryOp, UnionPart, UpdateStmt,
 };
 pub use lexer::{Lexer, Spanned, Token};
 pub use parser::Parser;
