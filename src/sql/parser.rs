@@ -321,24 +321,35 @@ impl Parser {
         } else {
             None
         };
-        self.expect(Token::KwValues)?;
-        let mut rows = Vec::new();
-        loop {
-            self.expect(Token::LParen)?;
-            let mut row = Vec::new();
-            loop {
-                row.push(self.parse_expression()?);
-                if !self.consume_if(&Token::Comma) {
-                    break;
+        // Two forms: `VALUES (...)` or `SELECT ...` (copy).
+        let source = match self.peek_tok() {
+            Some(Token::KwSelect) => {
+                let s = self.parse_select()?;
+                InsertSource::Select(Box::new(s))
+            }
+            Some(Token::KwValues) => {
+                self.bump();
+                let mut rows = Vec::new();
+                loop {
+                    self.expect(Token::LParen)?;
+                    let mut row = Vec::new();
+                    loop {
+                        row.push(self.parse_expression()?);
+                        if !self.consume_if(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    rows.push(row);
+                    if !self.consume_if(&Token::Comma) {
+                        break;
+                    }
                 }
+                InsertSource::Values(rows)
             }
-            self.expect(Token::RParen)?;
-            rows.push(row);
-            if !self.consume_if(&Token::Comma) {
-                break;
-            }
-        }
-        Ok(InsertStmt { table, columns, rows })
+            _ => return Err(self.err_here("expected VALUES or SELECT after INSERT INTO ...")),
+        };
+        Ok(InsertStmt { table, columns, source })
     }
 
     // ------------------------------------------------------------------
@@ -1175,7 +1186,21 @@ mod tests {
             Statement::Insert(s) => {
                 assert_eq!(s.table, "t");
                 assert_eq!(s.columns, Some(vec!["a".into(), "b".into()]));
-                assert_eq!(s.rows.len(), 2);
+                match s.source {
+                    InsertSource::Values(rows) => assert_eq!(rows.len(), 2),
+                    _ => panic!("expected VALUES source"),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn insert_select_form() {
+        let s = parse("INSERT INTO t (a, b) SELECT x, y FROM src");
+        match s {
+            Statement::Insert(s) => {
+                assert!(matches!(s.source, InsertSource::Select(_)));
             }
             _ => panic!(),
         }

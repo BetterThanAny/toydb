@@ -82,7 +82,14 @@ pub struct InsertStmt {
     pub table: String,
     /// `INSERT INTO t (a, b) VALUES (...)` — `None` means "use declared order".
     pub columns: Option<Vec<String>>,
-    pub rows: Vec<Vec<Expression>>,
+    /// Source of values: literal `VALUES (...)` or a `SELECT` to copy from.
+    pub source: InsertSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    Values(Vec<Vec<Expression>>),
+    Select(Box<SelectStmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

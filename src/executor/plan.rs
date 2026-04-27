@@ -20,8 +20,8 @@ use crate::executor::aggregate::{
 use crate::executor::expr::{eval, eval_with, Resolver};
 use crate::executor::result::{Column as ResultColumn, ResultSet};
 use crate::sql::ast::{
-    CreateTableStmt, DeleteStmt, DropTableStmt, Expression, FromClause, InsertStmt, JoinKind,
-    OrderBy, SelectItem, SelectStmt, Statement, UpdateStmt,
+    CreateTableStmt, DeleteStmt, DropTableStmt, Expression, FromClause, InsertSource, InsertStmt,
+    JoinKind, OrderBy, SelectItem, SelectStmt, Statement, UpdateStmt,
 };
 use crate::types::row::Row;
 use crate::types::value::Value;
@@ -100,16 +100,50 @@ impl<'a> Executor<'a> {
             None => (0..table.columns.len()).collect(),
             Some(names) => names.iter().map(|n| table.column_index(n)).collect::<Result<_>>()?,
         };
-        let mut count = 0usize;
-        for raw_row in &i.rows {
-            if raw_row.len() != target_indices.len() {
-                return Err(Error::ty(format!(
-                    "INSERT into {}: expected {} values, got {}",
-                    i.table,
-                    target_indices.len(),
-                    raw_row.len()
-                )));
+
+        // Materialise the rows to insert. For VALUES we just collect the
+        // ASTs; for SELECT we run the inner query and use its result set.
+        let raw_rows: Vec<Row> = match &i.source {
+            InsertSource::Values(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for raw in rows {
+                    if raw.len() != target_indices.len() {
+                        return Err(Error::ty(format!(
+                            "INSERT into {}: expected {} values, got {}",
+                            i.table,
+                            target_indices.len(),
+                            raw.len()
+                        )));
+                    }
+                    let mut row = Vec::with_capacity(raw.len());
+                    for e in raw {
+                        row.push(eval(e)?);
+                    }
+                    out.push(Row(row));
+                }
+                out
             }
+            InsertSource::Select(inner) => {
+                let rs = self.exec_select(inner)?;
+                match rs {
+                    ResultSet::Select { columns, rows } => {
+                        if columns.len() != target_indices.len() {
+                            return Err(Error::ty(format!(
+                                "INSERT INTO {}: SELECT produces {} columns, expected {}",
+                                i.table,
+                                columns.len(),
+                                target_indices.len()
+                            )));
+                        }
+                        rows
+                    }
+                    _ => return Err(Error::internal("inner SELECT did not return rows")),
+                }
+            }
+        };
+
+        let mut count = 0usize;
+        for incoming in raw_rows {
             let mut full = vec![Value::Null; table.columns.len()];
             for (idx, col) in table.columns.iter().enumerate() {
                 if target_indices.contains(&idx) {
@@ -120,8 +154,8 @@ impl<'a> Executor<'a> {
                     None => Value::Null,
                 };
             }
-            for (slot, expr) in target_indices.iter().zip(raw_row.iter()) {
-                full[*slot] = eval(expr)?;
+            for (slot, value) in target_indices.iter().zip(incoming.0) {
+                full[*slot] = value;
             }
             self.engine.insert(&i.table, Row(full))?;
             count += 1;
@@ -999,7 +1033,12 @@ fn rewrite_aliases(expr: &Expression, aliases: &HashMap<&str, &Expression>) -> E
 fn describe_plan(stmt: &Statement) -> String {
     match stmt {
         Statement::Select(s) => describe_select(s),
-        Statement::Insert(i) => format!("Insert into `{}` ({} rows)", i.table, i.rows.len()),
+        Statement::Insert(i) => match &i.source {
+            InsertSource::Values(rows) => {
+                format!("Insert into `{}` ({} rows from VALUES)", i.table, rows.len())
+            }
+            InsertSource::Select(_) => format!("Insert into `{}` (from SELECT)", i.table),
+        },
         Statement::Update(u) => format!(
             "Update `{}`{}",
             u.table,
