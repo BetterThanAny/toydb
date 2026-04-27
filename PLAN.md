@@ -1,71 +1,86 @@
-# toydb — 实现计划
+# toydb — implementation plan & status
 
-一个从零写起的 SQL 数据库引擎（教学用），**不**追求生产级性能，但在每一层做到结构清晰、可测试、可演进。
+A from-scratch SQL database engine in Rust, built as a teaching project.
+This file tracks both the original plan and what was actually delivered.
 
-## 总目标
+## Status: complete ✓
 
-| 层 | 关键能力 |
+| Layer | Status |
 |---|---|
-| SQL 前端 | 词法分析、递归下降解析、AST、错误定位 |
-| 类型系统 | NULL / Boolean / Integer / Float / String，类型转换规则 |
-| 表达式引擎 | 算术、比较、逻辑、字符串拼接、IS NULL、IN |
-| 存储引擎 | 抽象的 `Engine` trait（先 in-memory，再 disk-backed） |
-| 执行器 | 投影、过滤、扫描、Join、Aggregate、Sort、Limit |
-| 事务 | MVCC + 快照隔离，BEGIN/COMMIT/ROLLBACK |
-| 持久化 | page 文件 + B-tree 索引 + WAL + 重启恢复 |
-| 工具 | REPL、表格化输出、demo 脚本、benchmark |
+| SQL frontend | Lexer + recursive-descent parser, full positional errors |
+| AST | DDL (CREATE / DROP / **ALTER** TABLE), DML (INSERT incl. **INSERT ... SELECT**, UPDATE, DELETE), SELECT (WHERE / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET / **NULLS FIRST/LAST** / DISTINCT / JOIN / **CASE WHEN**), BEGIN / COMMIT / ROLLBACK, **EXPLAIN** |
+| Type system | NULL / BOOLEAN / INTEGER / FLOAT / STRING with three-valued logic |
+| Expression engine | Arithmetic / comparison / logic / concat / IS NULL / IN / BETWEEN / LIKE, scalar functions (~20 incl. ABS, ROUND, FLOOR/CEIL, SQRT, LENGTH, LOWER/UPPER, TRIM, REVERSE, REPEAT, REPLACE, SUBSTRING, CONCAT, COALESCE, NULLIF, IFF) |
+| Aggregates | COUNT / SUM / AVG / MIN / MAX with GROUP BY, HAVING, **DISTINCT** support |
+| Joins | INNER / LEFT / RIGHT (nested-loop) |
+| Storage engines | `MemoryEngine` (in-memory) and `DiskEngine` (page-based, slotted, free-list) |
+| Durability | Write-ahead log + recovery on open; torn-write tolerant |
+| Transactions | Snapshot isolation: `BEGIN` clones state, `ROLLBACK` restores, `COMMIT` discards snapshot (memory engine only) |
+| REPL | `toydb` CLI with `--db <path>`, `.tables`, `.schema`, `.help`, multi-line input |
 
-## 里程碑
+## Milestones (delivered)
 
-- **M0 项目骨架** — Cargo workspace、文档框架、git
-- **M1 SQL 词法分析** — `Token`、`Lexer`，全部关键字 / 字面量 / 操作符 通过
-- **M2 SQL 解析器** — AST + 递归下降，覆盖 DDL + DML + 事务语句
-- **M3 类型 / Catalog** — `Value` enum、`DataType`、`Column`、`Table`，Catalog
-- **M4 表达式引擎** — `Expression::eval(&Row, &Schema) -> Result<Value>`
-- **M5 内存执行器** — 单表 CRUD 走通端到端
-- **M6 REPL** — 可交互输入 SQL，得到表格化输出
-- **M7 聚合/排序/Join** — `GROUP BY` / `ORDER BY` / `LIMIT` / `JOIN`
-- **M8 持久化** — page-based 文件、buffer pool、WAL、recovery
-- **M9 MVCC 事务** — 多版本 KV、可见性规则、写写冲突检测
-- **M10 文档/demo/bench** — README、demo SQL、Criterion benchmark
+- **M0 Skeleton** — Cargo workspace, error type, module stubs, README, PLAN, CLAUDE.md, .gitignore.
+- **M1 Lexer** — keyword table, integer/float literals incl. scientific, single-quoted strings (with `''` escape), double-quoted identifiers, comments (`--`, `/* */` nestable), positional errors. 24 unit tests.
+- **M2 Parser + AST** — recursive descent + Pratt-climbing for expressions, full operator-precedence ladder, every DDL/DML/Tx statement. 50+ tests.
+- **M3 Catalog & Value system** — `Value`, `Row`, `Table`, `Column`, `Catalog` with constraints (PK / NOT NULL / UNIQUE / DEFAULT). Coercion rules, three-valued comparison.
+- **M4 Expression evaluator** — `eval_with(expr, &Resolver)`. Three-valued AND / OR / NOT, NULL propagation. SQL `LIKE` with `_` and `%`. Built-in functions.
+- **M5 Memory engine + executor** — single-table CRUD end-to-end, projection, `SingleTable` resolver.
+- **M6 REPL** — `toydb`, table-rendered output, `.tables`/`.help` meta commands, scripted mode.
+- **M7 Aggregates / sort / Joins** — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `INNER`/`LEFT`/`RIGHT JOIN`, `ORDER BY` with alias resolution, `LIMIT`/`OFFSET`. Wide-row resolver for joins.
+- **M8 Persistence** — page (8 KiB slotted), pager (file + cache + free list), super page with magic, write-ahead log, replay-on-open, multi-page chains for tables. `DiskEngine`.
+- **M9 Transactions** — snapshot isolation via `BEGIN` cloning state for the memory engine. `COMMIT` discards snapshot, `ROLLBACK` restores.
+- **M10 Polish** — `EXPLAIN`, `SELECT DISTINCT`, `COUNT(DISTINCT)`, `CASE WHEN ... END`, `INSERT ... SELECT`, `ALTER TABLE ADD COLUMN`, `NULLS FIRST/LAST`, `.schema` meta command, comprehensive test suite, multiple demos.
 
-## 验收命令
-
-每个里程碑后都跑：
+## Verification commands
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all
+cargo run --release -- examples/library.sql
+cargo run --release -- examples/movies.sql
+cargo run --release -- examples/orders.sql
+cargo run --release -- examples/txn.sql
 ```
 
-最终 demo：
+## Test inventory
 
-```bash
-cargo run --release --bin toydb -- examples/world.sql
-```
-
-## 测试矩阵
-
-| 类别 | 模块 | 工具 |
+| Suite | Count | What it covers |
 |---|---|---|
-| 单元 | lexer / parser / executor 等 | `cargo test` 每模块内 `#[cfg(test)] mod tests` |
-| 集成 | 从 SQL 字符串 → 结果 | `tests/sql_*.rs` |
-| 持久化 | 起 / 停 / 重启 | `tests/persistence_*.rs` |
-| 事务 | 并发隔离 | `tests/txn_*.rs` |
+| unit (in `src/`) | ~211 | Lexer, parser, expr evaluator, aggregate folding, page/pager/wal, memory & disk engines, executor, format |
+| `tests/sql_basic.rs` | 7 | end-to-end CRUD, NULL semantics, unique constraint propagation |
+| `tests/sql_comprehensive.rs` | 2 | "kitchen sink" queries spanning many features |
+| `tests/sql_persistence.rs` | 5 | open/close/reopen, multi-page tables, drop survival, WAL |
+| `tests/sql_stress.rs` | 4 | 5 k row inserts, 2 k×2 k join, 50× repeated update, disk round-trip |
+| `tests/sql_transaction.rs` | 8 | BEGIN/COMMIT/ROLLBACK semantics, nested-begin rejection, in-tx visibility |
 
-## 已安装工具
+Total: **237 tests**, all passing, zero clippy warnings.
 
-| 工具 | 安装命令 | 时间 | 原因 | 卸载命令 |
-|---|---|---|---|---|
-| rustc 1.95.0 | (已存在) | — | 编译器 | `rustup self uninstall` |
-| cargo 1.95.0 | (已存在) | — | 包管理 | 同上 |
+## Project size
 
-后续如新增 crate（`thiserror`、`rustyline`、`pretty_assertions`），通过 `cargo add` 写入，自动在 `Cargo.toml` 里追踪。
+- ~9.2 k lines Rust (`src/` incl. tests)
+- ~0.7 k lines integration tests (`tests/`)
+- ~0.2 k lines SQL examples (`examples/`)
+- 4 demo SQL scripts: `movies.sql`, `orders.sql`, `txn.sql`, `library.sql`
 
-## 风险与边界
+## Limitations (intentional)
 
-- 不追求 ANSI SQL 兼容；只覆盖核心语法
-- 不实现完整 ACID 中的 D（崩溃恢复只做 redo，不做 fuzzy checkpoint）
-- 不实现网络层；只做单机进程内库 + REPL
-- B-tree 实现追求正确性而非速度，不做 latch crabbing
+- No subqueries, CTEs, window functions, or `UNION`.
+- No real query optimisation: every join is nested-loop, no indexes.
+- No replication / sharding / consensus.
+- Toydb is single-threaded — concurrent transactions can't interleave.
+- `ALTER TABLE` and transactions only work on the memory engine; the disk engine errors on these and is meant to be opened, written, closed, and reopened in straight line.
+- `DECIMAL`/`DATE`/`UUID` types are out of scope; everything is one of five primitives.
+
+## Tools used
+
+| Tool | Why |
+|---|---|
+| `rustc` 1.95 / `cargo` 1.95 | Compiler & build system (already on machine) |
+| `clippy` | Lint with `-D warnings` enforced at every milestone |
+| `thiserror` 2.0 | Derive `Error` and `Display` for `crate::Error` |
+| `rustyline` 15.0 | REPL line editing + history |
+| `pretty_assertions` 1.4 (dev) | Better test diffs |
+
+No other crates pulled in; everything else is hand-written.
