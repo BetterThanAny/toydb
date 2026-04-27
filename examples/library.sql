@@ -77,7 +77,15 @@ SELECT title, year
    AND author_id IN (1, 2)
  ORDER BY year;
 
--- 7. CASE expression for categorisation.
+-- 7. Scalar subquery: how each book compares to the global average.
+SELECT title, pages,
+       pages - (SELECT AVG(pages) FROM books) AS pages_vs_avg
+  FROM books
+ WHERE pages IS NOT NULL
+ ORDER BY pages_vs_avg DESC
+ LIMIT 5;
+
+-- 8. CASE expression for categorisation.
 SELECT title,
        year,
        CASE WHEN year < 1980 THEN 'classic'
@@ -87,7 +95,7 @@ SELECT title,
   FROM books
  ORDER BY year;
 
--- 8. Transactional batch update.
+-- 9. Transactional batch update.
 BEGIN;
 UPDATE books SET in_stock = TRUE WHERE id = 2;
 DELETE FROM books WHERE pages IS NULL;
