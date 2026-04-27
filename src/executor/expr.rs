@@ -370,6 +370,38 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
         "LOWER" => string_unary(name, &evaled, |s| s.to_lowercase()),
         "UPPER" => string_unary(name, &evaled, |s| s.to_uppercase()),
         "TRIM" => string_unary(name, &evaled, |s| s.trim().to_string()),
+        "LTRIM" => string_unary(name, &evaled, |s| s.trim_start().to_string()),
+        "RTRIM" => string_unary(name, &evaled, |s| s.trim_end().to_string()),
+        "SIN" => unary_float(&evaled, f64::sin),
+        "COS" => unary_float(&evaled, f64::cos),
+        "TAN" => unary_float(&evaled, f64::tan),
+        "EXP" => unary_float(&evaled, f64::exp),
+        "LN" => unary_float(&evaled, f64::ln),
+        "LOG" | "LOG10" => unary_float(&evaled, f64::log10),
+        "POWER" | "POW" => {
+            check_arity(name, 2, &evaled)?;
+            match (&evaled[0], &evaled[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, b) if numeric(a) && numeric(b) => {
+                    Ok(Value::Float(to_f64(a.clone()).powf(to_f64(b.clone()))))
+                }
+                _ => Err(Error::ty("POWER expects two numeric arguments")),
+            }
+        }
+        "MOD" => {
+            check_arity(name, 2, &evaled)?;
+            match (&evaled[0], &evaled[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Integer(a), Value::Integer(b)) if *b != 0 => {
+                    Ok(Value::Integer(a.wrapping_rem(*b)))
+                }
+                (Value::Integer(_), Value::Integer(_)) => Err(Error::value("MOD by zero")),
+                (a, b) if numeric(a) && numeric(b) => {
+                    Ok(Value::Float(to_f64(a.clone()) % to_f64(b.clone())))
+                }
+                _ => Err(Error::ty("MOD expects two numeric arguments")),
+            }
+        }
         "REVERSE" => string_unary(name, &evaled, |s| s.chars().rev().collect()),
         "REPEAT" => {
             check_arity(name, 2, &evaled)?;
@@ -746,6 +778,34 @@ mod tests {
         assert_eq!(ev("REPEAT('ab', 3)"), Value::String("ababab".into()));
         assert_eq!(ev("REPLACE('hello', 'l', 'L')"), Value::String("heLLo".into()));
         assert_eq!(ev("REPEAT('x', 0)"), Value::String("".into()));
+    }
+
+    #[test]
+    fn trim_variants() {
+        assert_eq!(ev("LTRIM('  abc  ')"), Value::String("abc  ".into()));
+        assert_eq!(ev("RTRIM('  abc  ')"), Value::String("  abc".into()));
+        assert_eq!(ev("TRIM('  abc  ')"), Value::String("abc".into()));
+    }
+
+    #[test]
+    fn math_functions() {
+        match ev("SIN(0)") {
+            Value::Float(f) => assert!(f.abs() < 1e-9),
+            _ => panic!(),
+        }
+        match ev("COS(0)") {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-9),
+            _ => panic!(),
+        }
+        match ev("LN(1)") {
+            Value::Float(f) => assert!(f.abs() < 1e-9),
+            _ => panic!(),
+        }
+        match ev("POWER(2, 8)") {
+            Value::Float(f) => assert_eq!(f, 256.0),
+            _ => panic!(),
+        }
+        assert_eq!(ev("MOD(10, 3)"), Value::Integer(1));
     }
 
     #[test]
