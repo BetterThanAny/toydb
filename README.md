@@ -22,7 +22,7 @@ toydb> SELECT title, year FROM movies WHERE year >= 2016 ORDER BY rating DESC LI
 | Layer | Capabilities |
 |---|---|
 | SQL frontend | Hand-written lexer + recursive-descent parser, full positional error reporting |
-| AST | DDL (CREATE / DROP TABLE), DML (INSERT / UPDATE / DELETE), SELECT (WHERE / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET / JOIN), BEGIN / COMMIT / ROLLBACK |
+| AST | DDL (CREATE / DROP / ALTER TABLE), DML (INSERT incl. INSERT...SELECT, UPDATE, DELETE), SELECT (WHERE / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET / JOIN / DISTINCT / CASE WHEN), BEGIN / COMMIT / ROLLBACK, EXPLAIN |
 | Type system | NULL, BOOLEAN, INTEGER, FLOAT, STRING — with SQL three-valued logic |
 | Expressions | Arithmetic, comparison, logic, string concat, IS NULL, IN, BETWEEN, LIKE, `CASE WHEN`, scalar functions (`abs`, `lower`, `upper`, `length`, `substring`, `coalesce`, `nullif`, `iff`, `concat`, ...) |
 | Aggregates | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with `GROUP BY` / `HAVING` / `DISTINCT` (e.g. `COUNT(DISTINCT col)`) |
@@ -36,12 +36,13 @@ toydb> SELECT title, year FROM movies WHERE year >= 2016 ORDER BY rating DESC LI
 ## What it does NOT
 
 - Network protocol (no Postgres / MySQL wire — single process REPL only)
-- Subqueries, CTEs, window functions
+- Correlated subqueries, CTEs, window functions, UNION (only **uncorrelated scalar** subqueries are supported)
 - Real query optimisation (no indexes, no statistics, plan = nested loop everywhere)
 - Distributed anything (no replication, no sharding, no consensus)
 - Concurrent transactions (toydb is single-threaded)
 - B-tree / hash indexes (storage is unindexed, scans are O(n))
-- ALTER TABLE / VACUUM / type-length enforcement (`VARCHAR(N)` is parsed but `N` ignored)
+- VACUUM / type-length enforcement (`VARCHAR(N)` is parsed but `N` ignored)
+- ALTER TABLE on the disk engine (memory only — would require row-level rewrite of every page)
 
 ## Build & run
 
