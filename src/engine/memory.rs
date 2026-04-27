@@ -196,6 +196,47 @@ impl Engine for MemoryEngine {
     }
 
     fn in_transaction(&self) -> bool { self.snapshot.is_some() }
+
+    fn add_column(&mut self, table: &str, column: crate::catalog::Column) -> Result<()> {
+        let table_def = self.catalog.get_mut(table)?;
+        if table_def.columns.iter().any(|c| c.name == column.name) {
+            return Err(Error::schema(format!(
+                "column `{}` already exists in `{}`",
+                column.name, table
+            )));
+        }
+        // PRIMARY KEY columns can only be declared on empty tables — and
+        // we only support one PK per table anyway.
+        if column.primary_key && table_def.primary_key.is_some() {
+            return Err(Error::schema(format!(
+                "table `{table}` already has a PRIMARY KEY"
+            )));
+        }
+        // Compute the default value once (constant default → cheap).
+        let default = match &column.default {
+            Some(e) => crate::executor::expr::eval(e)?,
+            None => crate::types::value::Value::Null,
+        };
+        if !column.nullable && default.is_null() {
+            return Err(Error::constraint(format!(
+                "column `{}` is NOT NULL but has no default — refuse to fill existing rows with NULL",
+                column.name
+            )));
+        }
+        // Update schema.
+        if column.primary_key {
+            let idx = table_def.columns.len();
+            table_def.primary_key = Some(idx);
+        }
+        table_def.columns.push(column);
+        // Append the default to every existing row.
+        if let Some(rows) = self.data.get_mut(table) {
+            for (_, row) in rows.iter_mut() {
+                row.0.push(default.clone());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

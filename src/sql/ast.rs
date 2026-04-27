@@ -18,10 +18,22 @@ pub enum Statement {
     Delete(Box<DeleteStmt>),
     CreateTable(Box<CreateTableStmt>),
     DropTable(Box<DropTableStmt>),
+    AlterTable(Box<AlterTableStmt>),
     Begin,
     Commit,
     Rollback,
     Explain(Box<Statement>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableStmt {
+    pub name: String,
+    pub action: AlterAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    AddColumn(ColumnDef),
 }
 
 #[derive(Debug, Clone, PartialEq)]

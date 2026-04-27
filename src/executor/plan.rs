@@ -20,8 +20,9 @@ use crate::executor::aggregate::{
 use crate::executor::expr::{eval, eval_with, Resolver};
 use crate::executor::result::{Column as ResultColumn, ResultSet};
 use crate::sql::ast::{
-    CreateTableStmt, DeleteStmt, DropTableStmt, Expression, FromClause, InsertSource, InsertStmt,
-    JoinKind, OrderBy, SelectItem, SelectStmt, Statement, UpdateStmt,
+    AlterAction, AlterTableStmt, CreateTableStmt, DeleteStmt, DropTableStmt, Expression,
+    FromClause, InsertSource, InsertStmt, JoinKind, OrderBy, SelectItem, SelectStmt, Statement,
+    UpdateStmt,
 };
 use crate::types::row::Row;
 use crate::types::value::Value;
@@ -38,6 +39,7 @@ impl<'a> Executor<'a> {
         match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::DropTable(s) => self.exec_drop_table(s),
+            Statement::AlterTable(s) => self.exec_alter_table(s),
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Select(s) => self.exec_select(s),
             Statement::Update(s) => self.exec_update(s),
@@ -83,6 +85,25 @@ impl<'a> Executor<'a> {
         }
         self.engine.create_table(table)?;
         Ok(ResultSet::CreateTable { name: c.name.clone() })
+    }
+
+    fn exec_alter_table(&mut self, a: &AlterTableStmt) -> Result<ResultSet> {
+        match &a.action {
+            AlterAction::AddColumn(def) => {
+                // Validate constant default at create time.
+                if let Some(d) = &def.default {
+                    eval(d).map_err(|e| {
+                        Error::schema(format!(
+                            "DEFAULT for column `{}` is not constant: {e}",
+                            def.name
+                        ))
+                    })?;
+                }
+                let col: crate::catalog::Column = def.into();
+                self.engine.add_column(&a.name, col)?;
+                Ok(ResultSet::AlterTable { name: a.name.clone() })
+            }
+        }
     }
 
     fn exec_drop_table(&mut self, d: &DropTableStmt) -> Result<ResultSet> {
@@ -1051,6 +1072,7 @@ fn describe_plan(stmt: &Statement) -> String {
         ),
         Statement::CreateTable(c) => format!("CreateTable `{}`", c.name),
         Statement::DropTable(d) => format!("DropTable `{}`", d.name),
+        Statement::AlterTable(a) => format!("AlterTable `{}`", a.name),
         Statement::Begin => "Begin".into(),
         Statement::Commit => "Commit".into(),
         Statement::Rollback => "Rollback".into(),
@@ -1377,6 +1399,59 @@ mod tests {
     // ----- DISTINCT ---------------------------------------------------
 
     // ----- NULLS FIRST/LAST -------------------------------------------
+
+    // ----- ALTER TABLE ADD COLUMN -------------------------------------
+
+    #[test]
+    fn alter_table_add_column_with_default() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
+            INSERT INTO t VALUES (1, 'a'), (2, 'b');
+            ALTER TABLE t ADD COLUMN age INT DEFAULT 99;
+        ");
+        let r = run(&mut e, "SELECT id, name, age FROM t ORDER BY id").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows[0][2], Value::Integer(99));
+        assert_eq!(rows[1][2], Value::Integer(99));
+    }
+
+    #[test]
+    fn alter_table_add_column_nullable_no_default() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY);
+            INSERT INTO t VALUES (1);
+            ALTER TABLE t ADD email TEXT;
+        ");
+        let r = run(&mut e, "SELECT id, email FROM t").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows[0][1], Value::Null);
+    }
+
+    #[test]
+    fn alter_table_add_not_null_without_default_rejected() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY);
+            INSERT INTO t VALUES (1);
+        ");
+        let r = try_run(&mut e, "ALTER TABLE t ADD COLUMN x INT NOT NULL");
+        assert!(r.is_err(), "expected error: {r:?}");
+    }
+
+    #[test]
+    fn alter_table_duplicate_column_rejected() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+        let r = try_run(&mut e, "ALTER TABLE t ADD COLUMN name TEXT");
+        assert!(r.is_err());
+    }
+
+    fn try_run(e: &mut MemoryEngine, sql: &str) -> Result<ResultSet> {
+        let stmt = Parser::parse_one(sql)?;
+        Executor::new(e).execute(&stmt)
+    }
 
     #[test]
     fn order_by_default_null_placement() {

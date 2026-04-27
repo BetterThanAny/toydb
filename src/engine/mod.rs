@@ -64,4 +64,12 @@ pub trait Engine {
 
     /// Whether a transaction is currently in progress.
     fn in_transaction(&self) -> bool { false }
+
+    /// Append a new column to an existing table. Default implementation
+    /// declines; engines override to support `ALTER TABLE`.
+    fn add_column(&mut self, _table: &str, _column: crate::catalog::Column) -> Result<()> {
+        Err(crate::error::Error::other(
+            "this engine does not support ALTER TABLE ADD COLUMN",
+        ))
+    }
 }

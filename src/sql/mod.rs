@@ -5,9 +5,9 @@ pub mod lexer;
 pub mod parser;
 
 pub use ast::{
-    BinaryOp, ColumnDef, CreateTableStmt, DataType, DeleteStmt, DropTableStmt, Expression,
-    FromClause, InsertStmt, JoinKind, Literal, OrderBy, SelectItem, SelectStmt, Statement,
-    UnaryOp, UpdateStmt,
+    AlterAction, AlterTableStmt, BinaryOp, ColumnDef, CreateTableStmt, DataType, DeleteStmt,
+    DropTableStmt, Expression, FromClause, InsertSource, InsertStmt, JoinKind, Literal, OrderBy,
+    SelectItem, SelectStmt, Statement, UnaryOp, UpdateStmt,
 };
 pub use lexer::{Lexer, Spanned, Token};
 pub use parser::Parser;

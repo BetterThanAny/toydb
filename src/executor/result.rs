@@ -17,6 +17,7 @@ impl Column {
 pub enum ResultSet {
     CreateTable { name: String },
     DropTable { name: String, existed: bool },
+    AlterTable { name: String },
     Insert { count: usize },
     Update { count: usize },
     Delete { count: usize },

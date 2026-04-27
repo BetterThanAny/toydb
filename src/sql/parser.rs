@@ -80,6 +80,7 @@ impl Parser {
                 .parse_create_table()
                 .map(|s| Statement::CreateTable(Box::new(s))),
             Token::KwDrop => self.parse_drop_table().map(|s| Statement::DropTable(Box::new(s))),
+            Token::KwAlter => self.parse_alter_table().map(|s| Statement::AlterTable(Box::new(s))),
             Token::KwBegin => {
                 self.bump();
                 // Optional `TRANSACTION` keyword.
@@ -496,6 +497,17 @@ impl Parser {
             }
         }
         Ok(ty)
+    }
+
+    fn parse_alter_table(&mut self) -> Result<AlterTableStmt> {
+        self.expect(Token::KwAlter)?;
+        self.expect(Token::KwTable)?;
+        let name = self.expect_ident("table name")?;
+        self.expect(Token::KwAdd)?;
+        // `COLUMN` is optional ergonomics, like Postgres.
+        let _ = self.consume_if(&Token::KwColumn);
+        let column = self.parse_column_def()?;
+        Ok(AlterTableStmt { name, action: AlterAction::AddColumn(column) })
     }
 
     fn parse_drop_table(&mut self) -> Result<DropTableStmt> {

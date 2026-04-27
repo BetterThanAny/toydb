@@ -23,6 +23,7 @@ pub fn render(rs: &ResultSet) -> String {
             render_table(&headers, &data)
         }
         ResultSet::CreateTable { name } => format!("CREATE TABLE {name}\n"),
+        ResultSet::AlterTable { name } => format!("ALTER TABLE {name}\n"),
         ResultSet::DropTable { name, existed } => {
             if *existed {
                 format!("DROP TABLE {name}\n")

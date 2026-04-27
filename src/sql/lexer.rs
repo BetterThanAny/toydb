@@ -100,6 +100,9 @@ pub enum Token {
     KwNulls,
     KwFirst,
     KwLast,
+    KwAlter,
+    KwAdd,
+    KwColumn,
 
     // -- punctuation -----------------------------------------------------
     Comma,
@@ -227,6 +230,9 @@ fn keyword(upper: &str) -> Option<Token> {
         "NULLS" => KwNulls,
         "FIRST" => KwFirst,
         "LAST" => KwLast,
+        "ALTER" => KwAlter,
+        "ADD" => KwAdd,
+        "COLUMN" => KwColumn,
         _ => return None,
     })
 }
