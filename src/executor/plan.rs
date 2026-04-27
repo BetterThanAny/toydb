@@ -54,7 +54,7 @@ impl<'a> Executor<'a> {
                 self.engine.rollback()?;
                 Ok(ResultSet::Rollback)
             }
-            Statement::Explain(_) => Err(Error::other("EXPLAIN is not implemented yet")),
+            Statement::Explain(inner) => Ok(ResultSet::Explain(describe_plan(inner))),
         }
     }
 
@@ -969,6 +969,102 @@ fn rewrite_aliases(expr: &Expression, aliases: &HashMap<&str, &Expression>) -> E
             otherwise: otherwise.as_ref().map(|e| Box::new(rewrite_aliases(e, aliases))),
         },
     }
+}
+
+// ---------------------------------------------------------------------
+// EXPLAIN — textual plan
+// ---------------------------------------------------------------------
+
+fn describe_plan(stmt: &Statement) -> String {
+    match stmt {
+        Statement::Select(s) => describe_select(s),
+        Statement::Insert(i) => format!("Insert into `{}` ({} rows)", i.table, i.rows.len()),
+        Statement::Update(u) => format!(
+            "Update `{}`{}",
+            u.table,
+            if u.r#where.is_some() { " (filtered)" } else { "" }
+        ),
+        Statement::Delete(d) => format!(
+            "Delete from `{}`{}",
+            d.table,
+            if d.r#where.is_some() { " (filtered)" } else { "" }
+        ),
+        Statement::CreateTable(c) => format!("CreateTable `{}`", c.name),
+        Statement::DropTable(d) => format!("DropTable `{}`", d.name),
+        Statement::Begin => "Begin".into(),
+        Statement::Commit => "Commit".into(),
+        Statement::Rollback => "Rollback".into(),
+        Statement::Explain(inner) => format!("Explain (nested):\n{}", describe_plan(inner)),
+    }
+}
+
+fn describe_select(s: &SelectStmt) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    match &s.from {
+        None => lines.push("Const".into()),
+        Some(from) => lines.extend(describe_from(from, 0)),
+    }
+    if s.r#where.is_some() {
+        lines.push("  Filter (WHERE)".into());
+    }
+    if !s.group_by.is_empty() || items_have_aggregate(s) {
+        if !s.group_by.is_empty() {
+            lines.push(format!("  GroupBy ({} keys)", s.group_by.len()));
+        } else {
+            lines.push("  Aggregate (single group)".into());
+        }
+    }
+    if s.having.is_some() {
+        lines.push("  Filter (HAVING)".into());
+    }
+    if !s.order_by.is_empty() {
+        lines.push(format!("  Sort ({} keys)", s.order_by.len()));
+    }
+    if s.distinct {
+        lines.push("  Distinct".into());
+    }
+    if s.limit.is_some() || s.offset.is_some() {
+        lines.push("  Limit / Offset".into());
+    }
+    lines.push(format!("  Project ({} items)", s.items.len()));
+    lines.join("\n")
+}
+
+fn describe_from(from: &FromClause, indent: usize) -> Vec<String> {
+    let pad = "  ".repeat(indent);
+    match from {
+        FromClause::Table { name, alias } => {
+            let alias = alias.as_deref().map(|a| format!(" AS {a}")).unwrap_or_default();
+            vec![format!("{pad}Scan `{name}`{alias}")]
+        }
+        FromClause::Join { left, kind, right, .. } => {
+            let mut out = vec![format!("{pad}{} Join", join_label(*kind))];
+            out.extend(describe_from(left, indent + 1));
+            out.extend(describe_from(right, indent + 1));
+            out
+        }
+    }
+}
+
+fn join_label(k: JoinKind) -> &'static str {
+    match k {
+        JoinKind::Inner => "Inner",
+        JoinKind::Left => "Left",
+        JoinKind::Right => "Right",
+    }
+}
+
+fn items_have_aggregate(s: &SelectStmt) -> bool {
+    let mut tmp = Vec::new();
+    for item in &s.items {
+        if let SelectItem::Expr { expr, .. } = item
+            && collect_aggregates(expr, &mut tmp).is_ok()
+            && !tmp.is_empty()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------
