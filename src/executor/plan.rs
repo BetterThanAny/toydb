@@ -410,7 +410,19 @@ impl<'a> Executor<'a> {
         if !s.order_by.is_empty() {
             emitted.sort_by(|a, b| {
                 for (i, ob) in s.order_by.iter().enumerate() {
-                    let cmp = a.sort_keys[i].total_cmp(&b.sort_keys[i]);
+                    let av = &a.sort_keys[i];
+                    let bv = &b.sort_keys[i];
+                    match (av.is_null(), bv.is_null()) {
+                        (true, true) => continue,
+                        (true, false) => {
+                            return if ob.nulls_first { Ordering::Less } else { Ordering::Greater };
+                        }
+                        (false, true) => {
+                            return if ob.nulls_first { Ordering::Greater } else { Ordering::Less };
+                        }
+                        (false, false) => {}
+                    }
+                    let cmp = av.total_cmp(bv);
                     if cmp != Ordering::Equal {
                         return if ob.asc { cmp } else { cmp.reverse() };
                     }
@@ -876,7 +888,16 @@ fn sort_rows_wide(rows: &mut [Row], order_by: &[OrderBy], schema: &WideSchema) -
     }
     keyed.sort_by(|a, b| {
         for (i, ob) in order_by.iter().enumerate() {
-            let cmp = a.keys[i].total_cmp(&b.keys[i]);
+            let av = &a.keys[i];
+            let bv = &b.keys[i];
+            // Apply NULLS FIRST/LAST first.
+            match (av.is_null(), bv.is_null()) {
+                (true, true) => continue,
+                (true, false) => return if ob.nulls_first { Ordering::Less } else { Ordering::Greater },
+                (false, true) => return if ob.nulls_first { Ordering::Greater } else { Ordering::Less },
+                (false, false) => {}
+            }
+            let cmp = av.total_cmp(bv);
             if cmp != Ordering::Equal {
                 return if ob.asc { cmp } else { cmp.reverse() };
             }
@@ -1315,6 +1336,44 @@ mod tests {
     }
 
     // ----- DISTINCT ---------------------------------------------------
+
+    // ----- NULLS FIRST/LAST -------------------------------------------
+
+    #[test]
+    fn order_by_default_null_placement() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, n INT);
+            INSERT INTO t VALUES (1,1),(2,NULL),(3,3),(4,NULL);
+        ");
+        // ASC default: NULLS LAST
+        let r = run(&mut e, "SELECT id FROM t ORDER BY n ASC").unwrap();
+        let rows = assert_select(&r);
+        // First two rows should be the non-null ones (id 1, 3) in ascending order.
+        assert_eq!(rows[0][0], Value::Integer(1));
+        assert_eq!(rows[1][0], Value::Integer(3));
+        // Last two are the NULL rows.
+        // DESC default: NULLS FIRST
+        let r = run(&mut e, "SELECT id FROM t ORDER BY n DESC").unwrap();
+        let rows = assert_select(&r);
+        // First two rows should be the NULL ones.
+        assert!(matches!(rows[0][0], Value::Integer(2 | 4)));
+        assert!(matches!(rows[1][0], Value::Integer(2 | 4)));
+    }
+
+    #[test]
+    fn order_by_explicit_nulls_first() {
+        let mut e = MemoryEngine::new();
+        run_all(&mut e, "
+            CREATE TABLE t (id INT PRIMARY KEY, n INT);
+            INSERT INTO t VALUES (1,1),(2,NULL),(3,3);
+        ");
+        let r = run(&mut e, "SELECT id FROM t ORDER BY n ASC NULLS FIRST").unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows[0][0], Value::Integer(2)); // NULL row first
+        assert_eq!(rows[1][0], Value::Integer(1));
+        assert_eq!(rows[2][0], Value::Integer(3));
+    }
 
     #[test]
     fn select_distinct_dedupes() {

@@ -172,7 +172,18 @@ impl Parser {
                     }
                     _ => true,
                 };
-                order_by.push(OrderBy { expr, asc });
+                // NULLS FIRST | NULLS LAST. Default mirrors Postgres:
+                // ASC → LAST, DESC → FIRST.
+                let nulls_first = if self.consume_if(&Token::KwNulls) {
+                    match self.peek_tok() {
+                        Some(Token::KwFirst) => { self.bump(); true }
+                        Some(Token::KwLast) => { self.bump(); false }
+                        _ => return Err(self.err_here("expected NULLS FIRST or NULLS LAST")),
+                    }
+                } else {
+                    !asc
+                };
+                order_by.push(OrderBy { expr, asc, nulls_first });
                 if !self.consume_if(&Token::Comma) {
                     break;
                 }

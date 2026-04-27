@@ -370,6 +370,27 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
         "LOWER" => string_unary(name, &evaled, |s| s.to_lowercase()),
         "UPPER" => string_unary(name, &evaled, |s| s.to_uppercase()),
         "TRIM" => string_unary(name, &evaled, |s| s.trim().to_string()),
+        "REVERSE" => string_unary(name, &evaled, |s| s.chars().rev().collect()),
+        "REPEAT" => {
+            check_arity(name, 2, &evaled)?;
+            match (&evaled[0], &evaled[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::String(s), Value::Integer(n)) if *n >= 0 => {
+                    Ok(Value::String(s.repeat(*n as usize)))
+                }
+                _ => Err(Error::ty("REPEAT(string, non-negative-int)")),
+            }
+        }
+        "REPLACE" => {
+            check_arity(name, 3, &evaled)?;
+            match (&evaled[0], &evaled[1], &evaled[2]) {
+                (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
+                (Value::String(s), Value::String(from), Value::String(to)) => {
+                    Ok(Value::String(s.replace(from.as_str(), to)))
+                }
+                _ => Err(Error::ty("REPLACE expects three string arguments")),
+            }
+        }
         "SUBSTRING" | "SUBSTR" => substring(&evaled),
         "CONCAT" => {
             let mut out = String::new();
@@ -717,6 +738,14 @@ mod tests {
     fn nullif_function() {
         assert_eq!(ev("NULLIF(1, 1)"), Value::Null);
         assert_eq!(ev("NULLIF(1, 2)"), Value::Integer(1));
+    }
+
+    #[test]
+    fn reverse_repeat_replace() {
+        assert_eq!(ev("REVERSE('abc')"), Value::String("cba".into()));
+        assert_eq!(ev("REPEAT('ab', 3)"), Value::String("ababab".into()));
+        assert_eq!(ev("REPLACE('hello', 'l', 'L')"), Value::String("heLLo".into()));
+        assert_eq!(ev("REPEAT('x', 0)"), Value::String("".into()));
     }
 
     #[test]

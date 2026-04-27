@@ -97,6 +97,9 @@ pub enum Token {
     KwThen,
     KwElse,
     KwEnd,
+    KwNulls,
+    KwFirst,
+    KwLast,
 
     // -- punctuation -----------------------------------------------------
     Comma,
@@ -221,6 +224,9 @@ fn keyword(upper: &str) -> Option<Token> {
         "THEN" => KwThen,
         "ELSE" => KwElse,
         "END" => KwEnd,
+        "NULLS" => KwNulls,
+        "FIRST" => KwFirst,
+        "LAST" => KwLast,
         _ => return None,
     })
 }

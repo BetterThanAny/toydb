@@ -72,6 +72,9 @@ pub struct OrderBy {
     pub expr: Expression,
     /// `true` for `ASC` (or default), `false` for `DESC`.
     pub asc: bool,
+    /// `NULLS FIRST` / `NULLS LAST`. SQL default depends on direction —
+    /// we use Postgres semantics: `ASC` → NULLS LAST, `DESC` → NULLS FIRST.
+    pub nulls_first: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
