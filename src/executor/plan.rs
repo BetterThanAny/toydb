@@ -14,10 +14,10 @@ use crate::catalog::Table;
 use crate::engine::{Engine, RowId};
 use crate::error::{Error, Result};
 use crate::executor::aggregate::{
-    aggregate_kind, collect_aggregates, eval_in_group, fold_row, fresh_accumulators, AggKey,
-    AggSpec, Groups, GroupKey,
+    AggKey, AggSpec, GroupKey, Groups, aggregate_kind, collect_aggregates, eval_in_group, fold_row,
+    fresh_accumulators,
 };
-use crate::executor::expr::{eval, eval_with, Resolver};
+use crate::executor::expr::{Resolver, eval, eval_with};
 use crate::executor::result::{Column as ResultColumn, ResultSet};
 use crate::sql::ast::{
     AlterAction, AlterTableStmt, CreateTableStmt, DeleteStmt, DropTableStmt, Expression,
@@ -32,7 +32,9 @@ pub struct Executor<'a> {
 }
 
 impl<'a> Executor<'a> {
-    pub fn new(engine: &'a mut dyn Engine) -> Self { Self { engine } }
+    pub fn new(engine: &'a mut dyn Engine) -> Self {
+        Self { engine }
+    }
 
     /// Run one statement against the engine.
     ///
@@ -167,7 +169,9 @@ impl<'a> Executor<'a> {
                     self.resolve_subqueries_expr(it)?;
                 }
             }
-            Expression::Between { expr, low, high, .. } => {
+            Expression::Between {
+                expr, low, high, ..
+            } => {
                 self.resolve_subqueries_expr(expr)?;
                 self.resolve_subqueries_expr(low)?;
                 self.resolve_subqueries_expr(high)?;
@@ -181,7 +185,11 @@ impl<'a> Executor<'a> {
                     self.resolve_subqueries_expr(a)?;
                 }
             }
-            Expression::Case { operand, branches, otherwise } => {
+            Expression::Case {
+                operand,
+                branches,
+                otherwise,
+            } => {
                 if let Some(op) = operand.as_mut() {
                     self.resolve_subqueries_expr(op)?;
                 }
@@ -210,7 +218,14 @@ impl<'a> Executor<'a> {
                 }
                 match rows.len() {
                     0 => Ok(Value::Null),
-                    1 => Ok(rows.into_iter().next().unwrap().0.into_iter().next().unwrap()),
+                    1 => Ok(rows
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                        .0
+                        .into_iter()
+                        .next()
+                        .unwrap()),
                     n => Err(Error::other(format!(
                         "scalar subquery returned {n} rows, expected 0 or 1"
                     ))),
@@ -227,7 +242,9 @@ impl<'a> Executor<'a> {
     fn exec_create_table(&mut self, c: &CreateTableStmt) -> Result<ResultSet> {
         if self.engine.list_tables().iter().any(|n| n == &c.name) {
             if c.if_not_exists {
-                return Ok(ResultSet::CreateTable { name: c.name.clone() });
+                return Ok(ResultSet::CreateTable {
+                    name: c.name.clone(),
+                });
             }
             return Err(Error::schema(format!("table `{}` already exists", c.name)));
         }
@@ -244,7 +261,9 @@ impl<'a> Executor<'a> {
             }
         }
         self.engine.create_table(table)?;
-        Ok(ResultSet::CreateTable { name: c.name.clone() })
+        Ok(ResultSet::CreateTable {
+            name: c.name.clone(),
+        })
     }
 
     fn exec_alter_table(&mut self, a: &AlterTableStmt) -> Result<ResultSet> {
@@ -261,14 +280,19 @@ impl<'a> Executor<'a> {
                 }
                 let col: crate::catalog::Column = def.into();
                 self.engine.add_column(&a.name, col)?;
-                Ok(ResultSet::AlterTable { name: a.name.clone() })
+                Ok(ResultSet::AlterTable {
+                    name: a.name.clone(),
+                })
             }
         }
     }
 
     fn exec_drop_table(&mut self, d: &DropTableStmt) -> Result<ResultSet> {
         let existed = self.engine.drop_table(&d.name, d.if_exists)?;
-        Ok(ResultSet::DropTable { name: d.name.clone(), existed })
+        Ok(ResultSet::DropTable {
+            name: d.name.clone(),
+            existed,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -279,7 +303,19 @@ impl<'a> Executor<'a> {
         let table = self.engine.get_table(&i.table)?.clone();
         let target_indices: Vec<usize> = match &i.columns {
             None => (0..table.columns.len()).collect(),
-            Some(names) => names.iter().map(|n| table.column_index(n)).collect::<Result<_>>()?,
+            Some(names) => {
+                for (idx, name) in names.iter().enumerate() {
+                    if names[..idx].iter().any(|prev| prev == name) {
+                        return Err(Error::schema(format!(
+                            "INSERT column `{name}` specified more than once"
+                        )));
+                    }
+                }
+                names
+                    .iter()
+                    .map(|n| table.column_index(n))
+                    .collect::<Result<_>>()?
+            }
         };
 
         // Materialise the rows to insert. For VALUES we just collect the
@@ -376,8 +412,7 @@ impl<'a> Executor<'a> {
         // is compatible with anything; numeric columns may mix Integer
         // and Float (one promotes to the other), but mixing types like
         // String + Integer is rejected.
-        let mut col_types: Vec<Option<crate::sql::ast::DataType>> =
-            vec![None; columns.len()];
+        let mut col_types: Vec<Option<crate::sql::ast::DataType>> = vec![None; columns.len()];
         for r in &rows {
             update_union_types(&mut col_types, r)?;
         }
@@ -436,14 +471,19 @@ impl<'a> Executor<'a> {
         if let Some(predicate) = &s.r#where {
             let mut kept = Vec::with_capacity(rows.len());
             for row in rows {
-                let resolver = WideResolver { schema: &schema, row: &row };
+                let resolver = WideResolver {
+                    schema: &schema,
+                    row: &row,
+                };
                 match eval_with(predicate, &resolver)? {
                     Value::Boolean(true) => kept.push(row),
                     Value::Boolean(false) | Value::Null => {}
-                    other => return Err(Error::ty(format!(
-                        "WHERE expects boolean, got {}",
-                        other.type_name()
-                    ))),
+                    other => {
+                        return Err(Error::ty(format!(
+                            "WHERE expects boolean, got {}",
+                            other.type_name()
+                        )));
+                    }
                 }
             }
             rows = kept;
@@ -471,8 +511,9 @@ impl<'a> Executor<'a> {
 
     /// Constant SELECT (`SELECT 1+1`) — no FROM, single output row.
     fn exec_const_select(&mut self, s: &SelectStmt) -> Result<ResultSet> {
-        if s.r#where.is_some() || !s.order_by.is_empty() || s.limit.is_some() {
-            return Err(Error::other("WHERE/ORDER/LIMIT need a FROM clause"));
+        if s.r#where.is_some() || !s.order_by.is_empty() || s.limit.is_some() || s.offset.is_some()
+        {
+            return Err(Error::other("WHERE/ORDER/LIMIT/OFFSET need a FROM clause"));
         }
         if !s.group_by.is_empty() || s.having.is_some() {
             return Err(Error::other("GROUP BY / HAVING need a FROM clause"));
@@ -493,7 +534,10 @@ impl<'a> Executor<'a> {
             columns.push(ResultColumn::new(name));
             row.push(value);
         }
-        Ok(ResultSet::Select { columns, rows: vec![Row(row)] })
+        Ok(ResultSet::Select {
+            columns,
+            rows: vec![Row(row)],
+        })
     }
 
     /// Simple (non-aggregated) projection.
@@ -512,7 +556,10 @@ impl<'a> Executor<'a> {
             .items
             .iter()
             .filter_map(|i| match i {
-                SelectItem::Expr { expr, alias: Some(a) } => Some((a.as_str(), expr)),
+                SelectItem::Expr {
+                    expr,
+                    alias: Some(a),
+                } => Some((a.as_str(), expr)),
                 _ => None,
             })
             .collect();
@@ -536,7 +583,9 @@ impl<'a> Executor<'a> {
         let mut projected: Vec<Row> = Vec::new();
         let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
         for row in rows.into_iter().skip(offset) {
-            if projected.len() >= limit { break; }
+            if projected.len() >= limit {
+                break;
+            }
             let resolver = WideResolver { schema, row: &row };
             let mut emitted = Vec::with_capacity(plan.len());
             for proj in &plan {
@@ -554,7 +603,10 @@ impl<'a> Executor<'a> {
             }
             projected.push(Row(emitted));
         }
-        Ok(ResultSet::Select { columns, rows: projected })
+        Ok(ResultSet::Select {
+            columns,
+            rows: projected,
+        })
     }
 
     /// Grouped projection: builds groups, accumulates aggregates, then
@@ -590,9 +642,8 @@ impl<'a> Executor<'a> {
         if s.group_by.is_empty() {
             let key = GroupKey(vec![]);
             order.push(key.clone());
-            let mut accs = fresh_accumulators(
-                &aggs.iter().map(|(_, a)| a.clone()).collect::<Vec<_>>(),
-            );
+            let mut accs =
+                fresh_accumulators(&aggs.iter().map(|(_, a)| a.clone()).collect::<Vec<_>>());
             // Capture an empty group representative for non-aggregate evaluation.
             // Allowed only when no non-aggregate SELECT items exist.
             for row in &rows {
@@ -635,9 +686,14 @@ impl<'a> Executor<'a> {
                         (Some(a), _) => a.clone(),
                         (None, Expression::Column(c)) => c.clone(),
                         (None, Expression::Qualified(_, c)) => c.clone(),
-                        (None, Expression::Function { name, args, distinct })
-                            if aggregate_kind(name).is_some() =>
-                        {
+                        (
+                            None,
+                            Expression::Function {
+                                name,
+                                args,
+                                distinct,
+                            },
+                        ) if aggregate_kind(name).is_some() => {
                             let upper = name.to_ascii_uppercase();
                             if args.iter().any(|a| matches!(a, Expression::Wildcard)) {
                                 format!("{}(*)", upper)
@@ -655,7 +711,10 @@ impl<'a> Executor<'a> {
             .collect::<Result<_>>()?;
 
         // For each group, finalise accumulators and run projection / HAVING.
-        struct Emitted { sort_keys: Vec<Value>, row: Row }
+        struct Emitted {
+            sort_keys: Vec<Value>,
+            row: Row,
+        }
         let mut emitted: Vec<Emitted> = Vec::new();
         for key in &order {
             let accs = groups.get(key).expect("key from order list");
@@ -678,10 +737,12 @@ impl<'a> Executor<'a> {
                 match eval_in_group(having, &aggs, &finals, &rep_resolver)? {
                     Value::Boolean(true) => {}
                     Value::Boolean(false) | Value::Null => continue,
-                    other => return Err(Error::ty(format!(
-                        "HAVING expects boolean, got {}",
-                        other.type_name()
-                    ))),
+                    other => {
+                        return Err(Error::ty(format!(
+                            "HAVING expects boolean, got {}",
+                            other.type_name()
+                        )));
+                    }
                 }
             }
 
@@ -701,7 +762,10 @@ impl<'a> Executor<'a> {
                 .items
                 .iter()
                 .filter_map(|i| match i {
-                    SelectItem::Expr { expr, alias: Some(a) } => Some((a.as_str(), expr)),
+                    SelectItem::Expr {
+                        expr,
+                        alias: Some(a),
+                    } => Some((a.as_str(), expr)),
                     _ => None,
                 })
                 .collect();
@@ -710,7 +774,10 @@ impl<'a> Executor<'a> {
                 let rewritten = rewrite_aliases(&ob.expr, &select_aliases);
                 sort_keys.push(eval_in_group(&rewritten, &aggs, &finals, &rep_resolver)?);
             }
-            emitted.push(Emitted { sort_keys, row: Row(row) });
+            emitted.push(Emitted {
+                sort_keys,
+                row: Row(row),
+            });
         }
 
         // ORDER BY.
@@ -722,10 +789,18 @@ impl<'a> Executor<'a> {
                     match (av.is_null(), bv.is_null()) {
                         (true, true) => continue,
                         (true, false) => {
-                            return if ob.nulls_first { Ordering::Less } else { Ordering::Greater };
+                            return if ob.nulls_first {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            };
                         }
                         (false, true) => {
-                            return if ob.nulls_first { Ordering::Greater } else { Ordering::Less };
+                            return if ob.nulls_first {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            };
                         }
                         (false, false) => {}
                     }
@@ -743,10 +818,14 @@ impl<'a> Executor<'a> {
         let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
         let mut rows: Vec<Row> = Vec::new();
         for e in emitted.into_iter().skip(offset) {
-            if rows.len() >= limit { break; }
+            if rows.len() >= limit {
+                break;
+            }
             if s.distinct {
                 let key = GroupKey(e.row.0.clone());
-                if !seen.insert(key) { continue; }
+                if !seen.insert(key) {
+                    continue;
+                }
             }
             rows.push(e.row);
         }
@@ -776,7 +855,12 @@ impl<'a> Executor<'a> {
                     rows: raw.into_iter().map(|(_, r)| r).collect(),
                 })
             }
-            FromClause::Join { left, kind, right, on } => {
+            FromClause::Join {
+                left,
+                kind,
+                right,
+                on,
+            } => {
                 let left = self.build_source(left)?;
                 let right = self.build_source(right)?;
                 let (schema, rows) = nested_loop_join(left, right, *kind, on)?;
@@ -794,26 +878,39 @@ impl<'a> Executor<'a> {
         let scan = self.engine.scan(&u.table)?;
 
         let mut assignments: Vec<(usize, &Expression)> = Vec::with_capacity(u.assignments.len());
-        for (col, expr) in &u.assignments {
+        for (pos, (col, expr)) in u.assignments.iter().enumerate() {
+            if u.assignments[..pos].iter().any(|(prev, _)| prev == col) {
+                return Err(Error::schema(format!(
+                    "UPDATE column `{col}` specified more than once"
+                )));
+            }
             let idx = table.column_index(col)?;
             assignments.push((idx, expr));
         }
 
         let mut to_update: Vec<(RowId, Row)> = Vec::new();
         for (id, row) in scan {
-            let resolver = SingleTable { table: &table, alias: &u.table, row: &row };
+            let resolver = SingleTable {
+                table: &table,
+                alias: &u.table,
+                row: &row,
+            };
             let take = match &u.r#where {
                 None => true,
                 Some(predicate) => match eval_with(predicate, &resolver)? {
                     Value::Boolean(true) => true,
                     Value::Boolean(false) | Value::Null => false,
-                    other => return Err(Error::ty(format!(
-                        "WHERE expects boolean, got {}",
-                        other.type_name()
-                    ))),
+                    other => {
+                        return Err(Error::ty(format!(
+                            "WHERE expects boolean, got {}",
+                            other.type_name()
+                        )));
+                    }
                 },
             };
-            if !take { continue; }
+            if !take {
+                continue;
+            }
             let mut new_row = row.clone();
             for (idx, expr) in &assignments {
                 new_row.0[*idx] = eval_with(expr, &resolver)?;
@@ -839,18 +936,26 @@ impl<'a> Executor<'a> {
             let take = match &d.r#where {
                 None => true,
                 Some(predicate) => {
-                    let resolver = SingleTable { table: &table, alias: &d.table, row: &row };
+                    let resolver = SingleTable {
+                        table: &table,
+                        alias: &d.table,
+                        row: &row,
+                    };
                     match eval_with(predicate, &resolver)? {
                         Value::Boolean(true) => true,
                         Value::Boolean(false) | Value::Null => false,
-                        other => return Err(Error::ty(format!(
-                            "WHERE expects boolean, got {}",
-                            other.type_name()
-                        ))),
+                        other => {
+                            return Err(Error::ty(format!(
+                                "WHERE expects boolean, got {}",
+                                other.type_name()
+                            )));
+                        }
                     }
                 }
             };
-            if take { victims.push(id); }
+            if take {
+                victims.push(id);
+            }
         }
         let count = victims.len();
         for id in victims {
@@ -901,7 +1006,6 @@ impl WideSchema {
         }
         Err(Error::schema(format!("no such column `{alias}.{name}`")))
     }
-
 }
 
 #[derive(Debug)]
@@ -1039,7 +1143,9 @@ fn nested_loop_join(
 ) -> Result<(WideSchema, Vec<Row>)> {
     let mut combined_columns = left.schema.columns.clone();
     combined_columns.extend(right.schema.columns.iter().cloned());
-    let combined_schema = WideSchema { columns: combined_columns };
+    let combined_schema = WideSchema {
+        columns: combined_columns,
+    };
     let right_arity = right.schema.columns.len();
     let left_arity = left.schema.columns.len();
 
@@ -1066,14 +1172,19 @@ fn nested_loop_join(
                 wide.extend_from_slice(&inner.0);
             }
             let row = Row(wide);
-            let resolver = WideResolver { schema: &combined_schema, row: &row };
+            let resolver = WideResolver {
+                schema: &combined_schema,
+                row: &row,
+            };
             let truthy = match eval_with(on, &resolver)? {
                 Value::Boolean(b) => b,
                 Value::Null => false,
-                other => return Err(Error::ty(format!(
-                    "ON expects boolean, got {}",
-                    other.type_name()
-                ))),
+                other => {
+                    return Err(Error::ty(format!(
+                        "ON expects boolean, got {}",
+                        other.type_name()
+                    )));
+                }
             };
             if truthy {
                 matched = true;
@@ -1084,11 +1195,15 @@ fn nested_loop_join(
             // Pad inner with NULLs.
             let mut wide = Vec::with_capacity(outer_arity + inner_arity);
             if swap {
-                for _ in 0..inner_arity { wide.push(Value::Null); }
+                for _ in 0..inner_arity {
+                    wide.push(Value::Null);
+                }
                 wide.extend_from_slice(&outer.0);
             } else {
                 wide.extend_from_slice(&outer.0);
-                for _ in 0..inner_arity { wide.push(Value::Null); }
+                for _ in 0..inner_arity {
+                    wide.push(Value::Null);
+                }
             }
             output.push(Row(wide));
         }
@@ -1161,7 +1276,10 @@ fn build_wide_projection<'a>(
 }
 
 fn sort_rows_wide(rows: &mut [Row], order_by: &[OrderBy], schema: &WideSchema) -> Result<()> {
-    struct Keyed { keys: Vec<Value>, row: Row }
+    struct Keyed {
+        keys: Vec<Value>,
+        row: Row,
+    }
     let mut keyed: Vec<Keyed> = Vec::with_capacity(rows.len());
     for row in rows.iter() {
         let resolver = WideResolver { schema, row };
@@ -1169,7 +1287,10 @@ fn sort_rows_wide(rows: &mut [Row], order_by: &[OrderBy], schema: &WideSchema) -
         for ob in order_by {
             k.push(eval_with(&ob.expr, &resolver)?);
         }
-        keyed.push(Keyed { keys: k, row: row.clone() });
+        keyed.push(Keyed {
+            keys: k,
+            row: row.clone(),
+        });
     }
     keyed.sort_by(|a, b| {
         for (i, ob) in order_by.iter().enumerate() {
@@ -1178,8 +1299,20 @@ fn sort_rows_wide(rows: &mut [Row], order_by: &[OrderBy], schema: &WideSchema) -
             // Apply NULLS FIRST/LAST first.
             match (av.is_null(), bv.is_null()) {
                 (true, true) => continue,
-                (true, false) => return if ob.nulls_first { Ordering::Less } else { Ordering::Greater },
-                (false, true) => return if ob.nulls_first { Ordering::Greater } else { Ordering::Less },
+                (true, false) => {
+                    return if ob.nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    };
+                }
+                (false, true) => {
+                    return if ob.nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    };
+                }
                 (false, false) => {}
             }
             let cmp = av.total_cmp(bv);
@@ -1202,9 +1335,14 @@ fn limit_eval(expr: &Option<Expression>, label: &str) -> Result<usize> {
             let v = eval(e)?;
             match v {
                 Value::Integer(n) if n >= 0 => Ok(n as usize),
-                Value::Integer(n) => Err(Error::value(format!("{label} must be non-negative, got {n}"))),
+                Value::Integer(n) => Err(Error::value(format!(
+                    "{label} must be non-negative, got {n}"
+                ))),
                 Value::Null => Ok(0),
-                other => Err(Error::ty(format!("{label} expects integer, got {}", other.type_name()))),
+                other => Err(Error::ty(format!(
+                    "{label} expects integer, got {}",
+                    other.type_name()
+                ))),
             }
         }
     }
@@ -1216,10 +1354,7 @@ fn limit_eval(expr: &Option<Expression>, label: &str) -> Result<usize> {
 /// - NULL is compatible with anything.
 /// - INTEGER and FLOAT are compatible (numeric promotion).
 /// - Otherwise the types must match exactly.
-fn update_union_types(
-    state: &mut [Option<crate::sql::ast::DataType>],
-    row: &Row,
-) -> Result<()> {
+fn update_union_types(state: &mut [Option<crate::sql::ast::DataType>], row: &Row) -> Result<()> {
     use crate::sql::ast::DataType;
     for (i, v) in row.0.iter().enumerate() {
         let Some(ty) = v.datatype() else { continue }; // NULL — accept any
@@ -1310,34 +1445,59 @@ fn rewrite_aliases(expr: &Expression, aliases: &HashMap<&str, &Expression>) -> E
             expr: Box::new(rewrite_aliases(expr, aliases)),
             negated: *negated,
         },
-        Expression::InList { expr, list, negated } => Expression::InList {
+        Expression::InList {
+            expr,
+            list,
+            negated,
+        } => Expression::InList {
             expr: Box::new(rewrite_aliases(expr, aliases)),
             list: list.iter().map(|e| rewrite_aliases(e, aliases)).collect(),
             negated: *negated,
         },
-        Expression::Between { expr, low, high, negated } => Expression::Between {
+        Expression::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expression::Between {
             expr: Box::new(rewrite_aliases(expr, aliases)),
             low: Box::new(rewrite_aliases(low, aliases)),
             high: Box::new(rewrite_aliases(high, aliases)),
             negated: *negated,
         },
-        Expression::Like { expr, pattern, negated } => Expression::Like {
+        Expression::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expression::Like {
             expr: Box::new(rewrite_aliases(expr, aliases)),
             pattern: Box::new(rewrite_aliases(pattern, aliases)),
             negated: *negated,
         },
-        Expression::Function { name, args, distinct } => Expression::Function {
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } => Expression::Function {
             name: name.clone(),
             args: args.iter().map(|a| rewrite_aliases(a, aliases)).collect(),
             distinct: *distinct,
         },
-        Expression::Case { operand, branches, otherwise } => Expression::Case {
-            operand: operand.as_ref().map(|e| Box::new(rewrite_aliases(e, aliases))),
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => Expression::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(rewrite_aliases(e, aliases))),
             branches: branches
                 .iter()
                 .map(|(w, t)| (rewrite_aliases(w, aliases), rewrite_aliases(t, aliases)))
                 .collect(),
-            otherwise: otherwise.as_ref().map(|e| Box::new(rewrite_aliases(e, aliases))),
+            otherwise: otherwise
+                .as_ref()
+                .map(|e| Box::new(rewrite_aliases(e, aliases))),
         },
     }
 }
@@ -1351,19 +1511,31 @@ fn describe_plan(stmt: &Statement) -> String {
         Statement::Select(s) => describe_select(s),
         Statement::Insert(i) => match &i.source {
             InsertSource::Values(rows) => {
-                format!("Insert into `{}` ({} rows from VALUES)", i.table, rows.len())
+                format!(
+                    "Insert into `{}` ({} rows from VALUES)",
+                    i.table,
+                    rows.len()
+                )
             }
             InsertSource::Select(_) => format!("Insert into `{}` (from SELECT)", i.table),
         },
         Statement::Update(u) => format!(
             "Update `{}`{}",
             u.table,
-            if u.r#where.is_some() { " (filtered)" } else { "" }
+            if u.r#where.is_some() {
+                " (filtered)"
+            } else {
+                ""
+            }
         ),
         Statement::Delete(d) => format!(
             "Delete from `{}`{}",
             d.table,
-            if d.r#where.is_some() { " (filtered)" } else { "" }
+            if d.r#where.is_some() {
+                " (filtered)"
+            } else {
+                ""
+            }
         ),
         Statement::CreateTable(c) => format!("CreateTable `{}`", c.name),
         Statement::DropTable(d) => format!("DropTable `{}`", d.name),
@@ -1418,10 +1590,15 @@ fn describe_from(from: &FromClause, indent: usize) -> Vec<String> {
     let pad = "  ".repeat(indent);
     match from {
         FromClause::Table { name, alias } => {
-            let alias = alias.as_deref().map(|a| format!(" AS {a}")).unwrap_or_default();
+            let alias = alias
+                .as_deref()
+                .map(|a| format!(" AS {a}"))
+                .unwrap_or_default();
             vec![format!("{pad}Scan `{name}`{alias}")]
         }
-        FromClause::Join { left, kind, right, .. } => {
+        FromClause::Join {
+            left, kind, right, ..
+        } => {
             let mut out = vec![format!("{pad}{} Join", join_label(*kind))];
             out.extend(describe_from(left, indent + 1));
             out.extend(describe_from(right, indent + 1));
@@ -1534,7 +1711,9 @@ mod tests {
     // ----- aggregates --------------------------------------------------
 
     fn setup_orders(e: &mut MemoryEngine) {
-        run_all(e, "
+        run_all(
+            e,
+            "
             CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT, amount INT, status TEXT);
             INSERT INTO orders VALUES
                 (1, 'alice', 100, 'paid'),
@@ -1543,7 +1722,8 @@ mod tests {
                 (4, 'carol',  50, 'pending'),
                 (5, 'bob',   300, 'paid'),
                 (6, 'alice', NULL, 'paid');
-        ");
+        ",
+        );
     }
 
     #[test]
@@ -1559,7 +1739,11 @@ mod tests {
     fn sum_skips_nulls() {
         let mut e = MemoryEngine::new();
         setup_orders(&mut e);
-        let r = run(&mut e, "SELECT SUM(amount) FROM orders WHERE status = 'paid'").unwrap();
+        let r = run(
+            &mut e,
+            "SELECT SUM(amount) FROM orders WHERE status = 'paid'",
+        )
+        .unwrap();
         let rows = assert_select(&r);
         // 100 + 200 + 150 + 300 (excludes NULL row 6 and pending row 4)
         assert_eq!(rows[0][0], Value::Integer(750));
@@ -1640,7 +1824,9 @@ mod tests {
     // ----- joins -------------------------------------------------------
 
     fn setup_join(e: &mut MemoryEngine) {
-        run_all(e, "
+        run_all(
+            e,
+            "
             CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
             CREATE TABLE posts (id INT PRIMARY KEY, user_id INT, title TEXT);
             INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
@@ -1648,7 +1834,8 @@ mod tests {
                 (1, 1, 'hello'),
                 (2, 1, 'world'),
                 (3, 2, 'rust');
-        ");
+        ",
+        );
     }
 
     #[test]
@@ -1679,7 +1866,10 @@ mod tests {
         // alice has 2 posts, bob has 1, carol has 0 → 4 total
         assert_eq!(rows.len(), 4);
         // Carol's row has NULL title.
-        let carol_rows: Vec<_> = rows.iter().filter(|r| r[0] == Value::String("carol".into())).collect();
+        let carol_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r[0] == Value::String("carol".into()))
+            .collect();
         assert_eq!(carol_rows.len(), 1);
         assert_eq!(carol_rows[0][1], Value::Null);
     }
@@ -1707,12 +1897,15 @@ mod tests {
     #[test]
     fn union_all_keeps_duplicates() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE a (x INT PRIMARY KEY);
             CREATE TABLE b (y INT PRIMARY KEY);
             INSERT INTO a VALUES (1),(2),(3);
             INSERT INTO b VALUES (3),(4),(5);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT x FROM a UNION ALL SELECT y FROM b").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 6);
@@ -1721,12 +1914,15 @@ mod tests {
     #[test]
     fn union_dedupes() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE a (x INT PRIMARY KEY);
             CREATE TABLE b (y INT PRIMARY KEY);
             INSERT INTO a VALUES (1),(2),(3);
             INSERT INTO b VALUES (3),(4),(5);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT x FROM a UNION SELECT y FROM b").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 5);
@@ -1735,12 +1931,15 @@ mod tests {
     #[test]
     fn union_type_mismatch_errors() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE a (x INT PRIMARY KEY);
             CREATE TABLE b (y TEXT PRIMARY KEY);
             INSERT INTO a VALUES (1);
             INSERT INTO b VALUES ('hello');
-        ");
+        ",
+        );
         let r = try_run(&mut e, "SELECT x FROM a UNION SELECT y FROM b");
         assert!(r.is_err(), "expected type mismatch, got {r:?}");
         assert!(r.unwrap_err().to_string().contains("UNION column"));
@@ -1750,12 +1949,15 @@ mod tests {
     fn union_int_float_compatible() {
         // INT and FLOAT are compatible — INT gets promoted.
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE a (x INT PRIMARY KEY);
             CREATE TABLE b (y FLOAT PRIMARY KEY);
             INSERT INTO a VALUES (1);
             INSERT INTO b VALUES (2.5);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT x FROM a UNION ALL SELECT y FROM b").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 2);
@@ -1764,10 +1966,13 @@ mod tests {
     #[test]
     fn union_with_null_columns_ok() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE a (x INT PRIMARY KEY, n INT);
             INSERT INTO a VALUES (1, NULL), (2, 5);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT n FROM a UNION ALL SELECT n FROM a").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 4);
@@ -1776,12 +1981,15 @@ mod tests {
     #[test]
     fn union_column_count_mismatch_errors() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE a (x INT PRIMARY KEY, y INT);
             CREATE TABLE b (z INT PRIMARY KEY);
             INSERT INTO a VALUES (1, 2);
             INSERT INTO b VALUES (3);
-        ");
+        ",
+        );
         let r = try_run(&mut e, "SELECT x, y FROM a UNION SELECT z FROM b");
         assert!(r.is_err());
     }
@@ -1791,10 +1999,13 @@ mod tests {
     #[test]
     fn scalar_subquery_in_where() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, n INT);
             INSERT INTO t VALUES (1,10),(2,30),(3,20);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT id FROM t WHERE n = (SELECT MAX(n) FROM t)").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 1);
@@ -1804,11 +2015,18 @@ mod tests {
     #[test]
     fn scalar_subquery_in_select() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, n INT);
             INSERT INTO t VALUES (1,10),(2,20),(3,30);
-        ");
-        let r = run(&mut e, "SELECT id, n - (SELECT AVG(n) FROM t) AS diff FROM t ORDER BY id").unwrap();
+        ",
+        );
+        let r = run(
+            &mut e,
+            "SELECT id, n - (SELECT AVG(n) FROM t) AS diff FROM t ORDER BY id",
+        )
+        .unwrap();
         let rows = assert_select(&r);
         // avg = 20 → diffs are -10, 0, 10 (as floats)
         assert_eq!(rows[0][1], Value::Float(-10.0));
@@ -1819,11 +2037,14 @@ mod tests {
     #[test]
     fn scalar_subquery_zero_rows_yields_null() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, n INT);
             INSERT INTO t VALUES (1,10);
             CREATE TABLE empty (id INT PRIMARY KEY);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT (SELECT id FROM empty) AS v").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows[0][0], Value::Null);
@@ -1832,10 +2053,13 @@ mod tests {
     #[test]
     fn scalar_subquery_multiple_rows_errors() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY);
             INSERT INTO t VALUES (1),(2),(3);
-        ");
+        ",
+        );
         let r = try_run(&mut e, "SELECT (SELECT id FROM t) AS v");
         assert!(r.is_err());
     }
@@ -1845,11 +2069,14 @@ mod tests {
     #[test]
     fn alter_table_add_column_with_default() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, name TEXT);
             INSERT INTO t VALUES (1, 'a'), (2, 'b');
             ALTER TABLE t ADD COLUMN age INT DEFAULT 99;
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT id, name, age FROM t ORDER BY id").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows[0][2], Value::Integer(99));
@@ -1859,11 +2086,14 @@ mod tests {
     #[test]
     fn alter_table_add_column_nullable_no_default() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY);
             INSERT INTO t VALUES (1);
             ALTER TABLE t ADD email TEXT;
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT id, email FROM t").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows[0][1], Value::Null);
@@ -1872,10 +2102,13 @@ mod tests {
     #[test]
     fn alter_table_add_not_null_without_default_rejected() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY);
             INSERT INTO t VALUES (1);
-        ");
+        ",
+        );
         let r = try_run(&mut e, "ALTER TABLE t ADD COLUMN x INT NOT NULL");
         assert!(r.is_err(), "expected error: {r:?}");
     }
@@ -1896,10 +2129,13 @@ mod tests {
     #[test]
     fn order_by_default_null_placement() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, n INT);
             INSERT INTO t VALUES (1,1),(2,NULL),(3,3),(4,NULL);
-        ");
+        ",
+        );
         // ASC default: NULLS LAST
         let r = run(&mut e, "SELECT id FROM t ORDER BY n ASC").unwrap();
         let rows = assert_select(&r);
@@ -1918,10 +2154,13 @@ mod tests {
     #[test]
     fn order_by_explicit_nulls_first() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, n INT);
             INSERT INTO t VALUES (1,1),(2,NULL),(3,3);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT id FROM t ORDER BY n ASC NULLS FIRST").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows[0][0], Value::Integer(2)); // NULL row first
@@ -1932,10 +2171,13 @@ mod tests {
     #[test]
     fn select_distinct_dedupes() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, c TEXT);
             INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a'),(4,'b'),(5,'c');
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT DISTINCT c FROM t ORDER BY c").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 3);
@@ -1944,10 +2186,13 @@ mod tests {
     #[test]
     fn select_distinct_with_limit() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, c TEXT);
             INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a'),(4,'c');
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT DISTINCT c FROM t ORDER BY c LIMIT 2").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 2);
@@ -1956,11 +2201,18 @@ mod tests {
     #[test]
     fn count_distinct_dedupes_values() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, c TEXT);
             INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a'),(4,'a'),(5,'c'),(6,NULL);
-        ");
-        let r = run(&mut e, "SELECT COUNT(*), COUNT(c), COUNT(DISTINCT c) FROM t").unwrap();
+        ",
+        );
+        let r = run(
+            &mut e,
+            "SELECT COUNT(*), COUNT(c), COUNT(DISTINCT c) FROM t",
+        )
+        .unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows[0][0], Value::Integer(6)); // all rows
         assert_eq!(rows[0][1], Value::Integer(5)); // non-null
@@ -1970,10 +2222,13 @@ mod tests {
     #[test]
     fn sum_distinct_dedupes() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, n INT);
             INSERT INTO t VALUES (1,5),(2,5),(3,7),(4,5);
-        ");
+        ",
+        );
         let r = run(&mut e, "SELECT SUM(n), SUM(DISTINCT n) FROM t").unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows[0][0], Value::Integer(22)); // 5+5+7+5
@@ -1983,13 +2238,20 @@ mod tests {
     #[test]
     fn select_distinct_with_aggregate() {
         let mut e = MemoryEngine::new();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE t (id INT PRIMARY KEY, city TEXT, n INT);
             INSERT INTO t VALUES (1,'x',1),(2,'x',2),(3,'y',3);
-        ");
+        ",
+        );
         // After GROUP BY each (city) yields one row anyway. DISTINCT is
         // a no-op but should still parse and execute.
-        let r = run(&mut e, "SELECT DISTINCT city FROM t GROUP BY city ORDER BY city").unwrap();
+        let r = run(
+            &mut e,
+            "SELECT DISTINCT city FROM t GROUP BY city ORDER BY city",
+        )
+        .unwrap();
         let rows = assert_select(&r);
         assert_eq!(rows.len(), 2);
     }

@@ -82,7 +82,9 @@ impl Page {
     }
 
     pub fn from_bytes(bytes: [u8; PAGE_SIZE]) -> Self {
-        Self { buf: Box::new(bytes) }
+        Self {
+            buf: Box::new(bytes),
+        }
     }
 
     pub fn page_type(&self) -> Result<PageType> {
@@ -147,6 +149,44 @@ impl Page {
         self.write_into_slot(slot_idx, data)
     }
 
+    /// Insert into a specific slot during WAL replay. The target slot must
+    /// be empty, or be the next fresh slot.
+    pub fn insert_at(&mut self, slot: u16, data: &[u8]) -> Result<()> {
+        let slot_idx = slot as usize;
+        let slot_count = self.slot_count() as usize;
+        if slot_idx > slot_count {
+            return Err(Error::other(format!(
+                "slot {slot} cannot be created before slots 0..{slot_count}"
+            )));
+        }
+        if slot_idx == slot_count {
+            if self.free_space() < data.len() {
+                return Err(Error::other(format!(
+                    "page full: need {} bytes, have {}",
+                    data.len(),
+                    self.free_space()
+                )));
+            }
+            self.set_slot_count(slot_idx as u32 + 1);
+            self.write_into_slot(slot_idx, data)?;
+            return Ok(());
+        }
+
+        let (_, len) = self.slot(slot_idx);
+        if len != 0 {
+            return Err(Error::other(format!("slot {slot} is occupied")));
+        }
+        if self.free_space_for_existing_slot() < data.len() {
+            return Err(Error::other(format!(
+                "page full: need {} bytes, have {}",
+                data.len(),
+                self.free_space_for_existing_slot()
+            )));
+        }
+        self.write_into_slot(slot_idx, data)?;
+        Ok(())
+    }
+
     /// Mark a slot as tombstoned. The record bytes stay in place but
     /// will be reclaimed by future inserts.
     pub fn delete(&mut self, slot: u16) -> Result<()> {
@@ -158,13 +198,16 @@ impl Page {
         Ok(())
     }
 
-    /// Update an existing slot in place if the new record fits, else
-    /// returns an error so the caller can allocate a fresh slot or page.
+    /// Update an existing slot if the new record fits in this page.
+    /// If it cannot fit, the page is left unchanged and an error is returned.
     pub fn update(&mut self, slot: u16, data: &[u8]) -> Result<()> {
         if slot as u32 >= self.slot_count() {
             return Err(Error::other(format!("slot {slot} out of range")));
         }
         let (off, len) = self.slot(slot as usize);
+        if len == 0 {
+            return Err(Error::other(format!("slot {slot} is tombstoned")));
+        }
         if data.len() <= len as usize {
             // Same size or shrinking: in-place.
             let start = off as usize;
@@ -174,11 +217,9 @@ impl Page {
             let dir_off = HEADER_SIZE + (slot as usize) * SLOT_SIZE;
             write_u32(&mut self.buf[..], dir_off + 4, data.len() as u32);
             Ok(())
+        } else if self.free_space_for_existing_slot() >= data.len() {
+            self.write_into_slot(slot as usize, data).map(|_| ())
         } else {
-            // Need to grow: tombstone old, reinsert.
-            self.delete(slot)?;
-            // Caller will pick a slot via insert; we return Err so
-            // they re-route. Returning ok would change the slot id.
             Err(Error::other("page update needs reallocation"))
         }
     }
@@ -206,17 +247,26 @@ impl Page {
         })
     }
 
-    pub fn raw(&self) -> &[u8; PAGE_SIZE] { &self.buf }
-    pub fn raw_mut(&mut self) -> &mut [u8; PAGE_SIZE] { &mut self.buf }
+    pub fn raw(&self) -> &[u8; PAGE_SIZE] {
+        &self.buf
+    }
+    pub fn raw_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        &mut self.buf
+    }
 
     /// Slice form of [`raw_mut`] for callers that need `&mut [u8]`.
-    pub fn raw_slice_mut(&mut self) -> &mut [u8] { &mut self.buf[..] }
+    pub fn raw_slice_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..]
+    }
 
     // -- internals -----------------------------------------------------
 
     fn slot(&self, idx: usize) -> (u32, u32) {
         let base = HEADER_SIZE + idx * SLOT_SIZE;
-        (read_u32(&self.buf[..], base), read_u32(&self.buf[..], base + 4))
+        (
+            read_u32(&self.buf[..], base),
+            read_u32(&self.buf[..], base + 4),
+        )
     }
 
     fn write_into_slot(&mut self, slot_idx: usize, data: &[u8]) -> Result<u16> {
@@ -299,13 +349,20 @@ mod tests {
     }
 
     #[test]
-    fn update_grow_returns_error_for_caller() {
+    fn update_grow_with_page_space_keeps_slot() {
         let mut p = Page::new(PageType::TableData);
         let s = p.insert(b"hi").unwrap();
-        // grow → caller must move it
-        assert!(p.update(s, b"hello").is_err());
-        // After the failed update, slot is tombstoned.
-        assert!(p.get(s).is_none());
+        p.update(s, b"hello").unwrap();
+        assert_eq!(p.get(s), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn failed_update_keeps_original_slot() {
+        let mut p = Page::new(PageType::TableData);
+        let s = p.insert(b"hi").unwrap();
+        let payload = vec![b'x'; PAGE_SIZE];
+        assert!(p.update(s, &payload).is_err());
+        assert_eq!(p.get(s), Some(&b"hi"[..]));
     }
 
     #[test]
@@ -342,5 +399,15 @@ mod tests {
         // Should reuse slot 0 (tombstoned) since smaller record fits.
         assert_eq!(s2, 0);
         assert_eq!(p.get(s2), Some(&b"vw"[..]));
+    }
+
+    #[test]
+    fn insert_at_reuses_exact_tombstone() {
+        let mut p = Page::new(PageType::TableData);
+        let s0 = p.insert(b"abc").unwrap();
+        let _ = p.insert(b"def").unwrap();
+        p.delete(s0).unwrap();
+        p.insert_at(s0, b"xyz").unwrap();
+        assert_eq!(p.get(s0), Some(&b"xyz"[..]));
     }
 }

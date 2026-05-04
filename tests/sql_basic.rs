@@ -10,7 +10,16 @@ use toydb::types::value::Value;
 
 fn run(engine: &mut MemoryEngine, sql: &str) -> ResultSet {
     let stmt = Parser::parse_one(sql).unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
-    Executor::new(engine).execute(&stmt).unwrap_or_else(|e| panic!("exec `{sql}`: {e}"))
+    Executor::new(engine)
+        .execute(&stmt)
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"))
+}
+
+fn try_run(engine: &mut MemoryEngine, sql: &str) -> Result<ResultSet, String> {
+    let stmt = Parser::parse_one(sql).map_err(|e| e.to_string())?;
+    Executor::new(engine)
+        .execute(&stmt)
+        .map_err(|e| e.to_string())
 }
 
 fn run_all(engine: &mut MemoryEngine, sql: &str) {
@@ -22,10 +31,13 @@ fn run_all(engine: &mut MemoryEngine, sql: &str) {
 #[test]
 fn basic_pipeline() {
     let mut e = MemoryEngine::new();
-    run_all(&mut e, "
+    run_all(
+        &mut e,
+        "
         CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT);
         INSERT INTO users VALUES (1, 'alice', 30), (2, 'bob', 25), (3, 'carol', 40);
-    ");
+    ",
+    );
 
     let r = run(&mut e, "SELECT name FROM users WHERE age > 28 ORDER BY age");
     match r {
@@ -41,10 +53,13 @@ fn basic_pipeline() {
 #[test]
 fn null_in_arithmetic_is_null() {
     let mut e = MemoryEngine::new();
-    run_all(&mut e, "
+    run_all(
+        &mut e,
+        "
         CREATE TABLE t (a INT, b INT);
         INSERT INTO t VALUES (1, 1), (2, NULL), (3, 3);
-    ");
+    ",
+    );
     let r = run(&mut e, "SELECT a + b FROM t ORDER BY a");
     match r {
         ResultSet::Select { rows, .. } => {
@@ -59,10 +74,13 @@ fn null_in_arithmetic_is_null() {
 #[test]
 fn unique_violation_propagates() {
     let mut e = MemoryEngine::new();
-    run_all(&mut e, "
+    run_all(
+        &mut e,
+        "
         CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE);
         INSERT INTO t VALUES (1, 'a@x'), (2, 'b@x');
-    ");
+    ",
+    );
     let stmt = Parser::parse_one("INSERT INTO t VALUES (3, 'a@x')").unwrap();
     let r = Executor::new(&mut e).execute(&stmt);
     assert!(r.is_err());
@@ -70,14 +88,189 @@ fn unique_violation_propagates() {
 }
 
 #[test]
+fn duplicate_insert_columns_are_rejected() {
+    let mut e = MemoryEngine::new();
+    run_all(&mut e, "CREATE TABLE t (a INT, b INT)");
+
+    let err = try_run(&mut e, "INSERT INTO t (a, a) VALUES (1, 2)").unwrap_err();
+    assert!(err.contains("specified more than once"));
+
+    let r = run(&mut e, "SELECT COUNT(*) FROM t");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows[0][0], Value::Integer(0));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn duplicate_update_columns_are_rejected() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT PRIMARY KEY, n INT);
+        INSERT INTO t VALUES (1, 10);
+    ",
+    );
+
+    let err = try_run(&mut e, "UPDATE t SET n = 20, n = 30 WHERE id = 1").unwrap_err();
+    assert!(err.contains("specified more than once"));
+
+    let r = run(&mut e, "SELECT n FROM t");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows[0][0], Value::Integer(10));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn alter_table_rejects_duplicate_unique_default() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (name TEXT);
+        INSERT INTO t VALUES ('a'), ('b');
+    ",
+    );
+
+    let err = try_run(
+        &mut e,
+        "ALTER TABLE t ADD COLUMN email TEXT UNIQUE DEFAULT 'same'",
+    )
+    .unwrap_err();
+    assert!(err.contains("duplicate"));
+
+    let r = run(&mut e, "SELECT name FROM t ORDER BY name");
+    match r {
+        ResultSet::Select { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::String("a".into()));
+        }
+        _ => panic!(),
+    }
+    assert!(try_run(&mut e, "SELECT email FROM t").is_err());
+}
+
+#[test]
+fn alter_table_rejects_duplicate_primary_key_default() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (name TEXT);
+        INSERT INTO t VALUES ('a'), ('b');
+    ",
+    );
+
+    let err = try_run(
+        &mut e,
+        "ALTER TABLE t ADD COLUMN id INT PRIMARY KEY DEFAULT 1",
+    )
+    .unwrap_err();
+    assert!(err.contains("duplicate"));
+
+    let r = run(&mut e, "SELECT name FROM t ORDER BY name");
+    match r {
+        ResultSet::Select { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 2);
+        }
+        _ => panic!(),
+    }
+    assert!(try_run(&mut e, "SELECT id FROM t").is_err());
+}
+
+#[test]
+fn constant_select_rejects_offset_without_from() {
+    let mut e = MemoryEngine::new();
+    let err = try_run(&mut e, "SELECT 1 OFFSET 1").unwrap_err();
+    assert!(err.contains("OFFSET"));
+}
+
+#[test]
+fn alter_table_coerces_default_to_column_type() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (name TEXT);
+        INSERT INTO t VALUES ('a');
+        ALTER TABLE t ADD COLUMN c INT DEFAULT '1';
+    ",
+    );
+
+    let r = run(&mut e, "SELECT c + 1 FROM t");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows[0][0], Value::Integer(2));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn alter_table_rejects_bad_default_type_without_schema_change() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (name TEXT);
+        INSERT INTO t VALUES ('a');
+    ",
+    );
+
+    let err = try_run(&mut e, "ALTER TABLE t ADD COLUMN c INT DEFAULT 'x'").unwrap_err();
+    assert!(err.contains("cannot parse"));
+    assert!(try_run(&mut e, "SELECT c FROM t").is_err());
+}
+
+#[test]
+fn primary_key_null_is_still_not_nullable() {
+    let mut e = MemoryEngine::new();
+    run_all(&mut e, "CREATE TABLE t (id INT PRIMARY KEY NULL)");
+
+    let err = try_run(&mut e, "INSERT INTO t VALUES (NULL)").unwrap_err();
+    assert!(err.contains("NOT NULL"));
+}
+
+#[test]
+fn alter_table_rejects_primary_key_null_default() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (name TEXT);
+        INSERT INTO t VALUES ('a');
+    ",
+    );
+
+    let err = try_run(
+        &mut e,
+        "ALTER TABLE t ADD COLUMN id INT PRIMARY KEY NULL DEFAULT NULL",
+    )
+    .unwrap_err();
+    assert!(err.contains("NOT NULL"));
+    assert!(try_run(&mut e, "SELECT id FROM t").is_err());
+}
+
+#[test]
 fn update_then_delete() {
     let mut e = MemoryEngine::new();
-    run_all(&mut e, "
+    run_all(
+        &mut e,
+        "
         CREATE TABLE t (id INT PRIMARY KEY, n INT);
         INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
         UPDATE t SET n = n * 2;
         DELETE FROM t WHERE n > 40;
-    ");
+    ",
+    );
     let r = run(&mut e, "SELECT id, n FROM t ORDER BY id");
     match r {
         ResultSet::Select { rows, .. } => {
@@ -92,7 +285,10 @@ fn update_then_delete() {
 #[test]
 fn case_insensitive_keywords_case_sensitive_ids() {
     let mut e = MemoryEngine::new();
-    run_all(&mut e, "create TABLE Users (Id int primary key, Name text);");
+    run_all(
+        &mut e,
+        "create TABLE Users (Id int primary key, Name text);",
+    );
     let r = run(&mut e, "INSERT INTO Users VALUES (1, 'alice')");
     match r {
         ResultSet::Insert { count } => assert_eq!(count, 1),

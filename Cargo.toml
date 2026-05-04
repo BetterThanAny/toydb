@@ -2,7 +2,7 @@
 name = "toydb"
 version = "0.1.0"
 edition = "2024"
-description = "A from-scratch SQL database engine in Rust: lexer, parser, MVCC, B-tree storage, WAL"
+description = "A from-scratch SQL database engine in Rust: lexer, parser, paged storage, WAL"
 license = "MIT"
 
 [lib]

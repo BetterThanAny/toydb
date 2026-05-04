@@ -6,8 +6,8 @@
 //! - [`catalog`]  — table and column metadata
 //! - [`engine`]   — pluggable storage engines (memory, disk)
 //! - [`executor`] — query planning and execution
-//! - [`storage`]  — low-level page / pager / B-tree / WAL
-//! - [`txn`]      — MVCC transaction layer
+//! - [`storage`]  — low-level page / pager / WAL
+//! - [`txn`]      — transaction extension point
 //!
 //! See `README.md` for an overview and `PLAN.md` for milestones.
 

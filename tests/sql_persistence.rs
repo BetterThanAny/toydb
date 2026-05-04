@@ -13,7 +13,10 @@ fn tmpdb() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let c = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("toydb-it-{}-{n}-{c}.db", std::process::id()))
 }
@@ -40,15 +43,25 @@ fn run(engine: &mut DiskEngine, sql: &str) -> ResultSet {
     Executor::new(engine).execute(&stmt).unwrap()
 }
 
+fn try_run(engine: &mut DiskEngine, sql: &str) -> Result<ResultSet, String> {
+    let stmt = Parser::parse_one(sql).map_err(|e| e.to_string())?;
+    Executor::new(engine)
+        .execute(&stmt)
+        .map_err(|e| e.to_string())
+}
+
 #[test]
 fn ddl_and_data_survive_close_reopen() {
     let path = tmpdb();
     {
         let mut e = DiskEngine::open(&path).unwrap();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);
             INSERT INTO notes VALUES (1, 'hello'), (2, 'world');
-        ");
+        ",
+        );
         e.checkpoint().unwrap();
     }
     {
@@ -70,12 +83,15 @@ fn updates_and_deletes_survive() {
     let path = tmpdb();
     {
         let mut e = DiskEngine::open(&path).unwrap();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE k (id INT PRIMARY KEY, n INT);
             INSERT INTO k VALUES (1, 10), (2, 20), (3, 30);
             UPDATE k SET n = n + 1 WHERE id <= 2;
             DELETE FROM k WHERE id = 3;
-        ");
+        ",
+        );
         e.checkpoint().unwrap();
     }
     {
@@ -94,14 +110,94 @@ fn updates_and_deletes_survive() {
 }
 
 #[test]
+fn failed_oversized_update_keeps_old_row() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (id INT PRIMARY KEY, payload TEXT);
+            INSERT INTO t VALUES (1, 'ok');
+        ",
+        );
+        let big = "x".repeat(9000);
+        let err = try_run(
+            &mut e,
+            &format!("UPDATE t SET payload = '{big}' WHERE id = 1"),
+        )
+        .unwrap_err();
+        assert!(err.contains("reallocation") || err.contains("page full"));
+
+        let r = run(&mut e, "SELECT id, payload FROM t");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(1));
+                assert_eq!(rows[0][1], Value::String("ok".into()));
+            }
+            _ => panic!(),
+        }
+        e.checkpoint().unwrap();
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT id, payload FROM t");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][1], Value::String("ok".into()));
+            }
+            _ => panic!(),
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn wal_replay_survives_delete_insert_slot_reuse() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (id INT PRIMARY KEY, value TEXT);
+            INSERT INTO t VALUES (1, 'old');
+            DELETE FROM t WHERE id = 1;
+            INSERT INTO t VALUES (2, 'new');
+        ",
+        );
+        // No checkpoint: reopen must replay a WAL containing insert/delete/insert
+        // records for the same physical slot.
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT id, value FROM t ORDER BY id");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(2));
+                assert_eq!(rows[0][1], Value::String("new".into()));
+            }
+            _ => panic!(),
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
 fn unique_constraint_persists() {
     let path = tmpdb();
     {
         let mut e = DiskEngine::open(&path).unwrap();
-        run_all(&mut e, "
+        run_all(
+            &mut e,
+            "
             CREATE TABLE u (id INT PRIMARY KEY, email TEXT UNIQUE);
             INSERT INTO u VALUES (1, 'a@x'), (2, 'b@x');
-        ");
+        ",
+        );
         e.checkpoint().unwrap();
     }
     {
@@ -119,7 +215,10 @@ fn many_inserts_span_pages() {
     let path = tmpdb();
     {
         let mut e = DiskEngine::open(&path).unwrap();
-        run_all(&mut e, "CREATE TABLE big (id INT PRIMARY KEY, payload TEXT)");
+        run_all(
+            &mut e,
+            "CREATE TABLE big (id INT PRIMARY KEY, payload TEXT)",
+        );
         let big = "x".repeat(500);
         for i in 0..100 {
             let sql = format!("INSERT INTO big VALUES ({i}, '{big}')");

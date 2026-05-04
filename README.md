@@ -1,7 +1,7 @@
 # toydb
 
 A from-scratch SQL database engine in Rust, built as a teaching project.
-~5 000 lines of code, ~210 tests, no production dependencies beyond
+~9 000 lines of code, ~250 tests, no production dependencies beyond
 `thiserror` and `rustyline`.
 
 ```sql
@@ -49,7 +49,7 @@ toydb> SELECT title, year FROM movies WHERE year >= 2016 ORDER BY rating DESC LI
 
 ```bash
 cargo build --release
-cargo test --all                    # ~210 tests across unit + integration
+cargo test --all                    # ~250 tests across unit + integration
 cargo clippy --all-targets -- -D warnings
 
 # REPL — in memory
@@ -140,7 +140,7 @@ src/
     ├── pager.rs         file-backed paged storage with cache
     └── wal.rs           append-only write-ahead log
 bin/toydb.rs           REPL entry
-tests/                 end-to-end SQL tests (basic, persistence, transactions)
+tests/                 end-to-end SQL tests (basic, comprehensive, persistence, stress, transactions)
 examples/              sample SQL scripts
 ```
 
@@ -148,8 +148,10 @@ examples/              sample SQL scripts
 
 | File | What it covers |
 |---|---|
-| `tests/sql_basic.rs` | end-to-end CRUD, NULL semantics, unique constraints, idempotent DDL |
+| `tests/sql_basic.rs` | end-to-end CRUD, NULL semantics, constraints, idempotent DDL, mutation error paths |
+| `tests/sql_comprehensive.rs` | broad feature pipelines and NULL three-valued logic |
 | `tests/sql_persistence.rs` | open/close/reopen, WAL replay, multi-page tables, drop-table durability |
+| `tests/sql_stress.rs` | larger in-memory and disk smoke workloads |
 | `tests/sql_transaction.rs` | BEGIN/COMMIT/ROLLBACK, snapshot semantics, nested-begin rejection |
 | each `src/<mod>/*.rs` | tight per-module unit tests (lexer, parser, expr, aggregate, page, pager, wal, ...) |
 

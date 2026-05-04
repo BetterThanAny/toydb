@@ -29,16 +29,15 @@ struct Snapshot {
 }
 
 impl MemoryEngine {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn catalog(&self) -> &Catalog { &self.catalog }
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
 
-    fn check_unique(
-        &self,
-        table: &Table,
-        new: &Row,
-        skip: Option<RowId>,
-    ) -> Result<()> {
+    fn check_unique(&self, table: &Table, new: &Row, skip: Option<RowId>) -> Result<()> {
         let store = self.data.get(&table.name);
         // For each unique column (including PK), check no other row holds
         // the same value. NULL never collides with anything (SQL semantics).
@@ -103,7 +102,9 @@ impl Engine for MemoryEngine {
         Ok(true)
     }
 
-    fn get_table(&self, name: &str) -> Result<&Table> { self.catalog.get(name) }
+    fn get_table(&self, name: &str) -> Result<&Table> {
+        self.catalog.get(name)
+    }
 
     fn list_tables(&self) -> Vec<String> {
         self.catalog.names().cloned().collect()
@@ -195,10 +196,16 @@ impl Engine for MemoryEngine {
         }
     }
 
-    fn in_transaction(&self) -> bool { self.snapshot.is_some() }
+    fn in_transaction(&self) -> bool {
+        self.snapshot.is_some()
+    }
 
-    fn add_column(&mut self, table: &str, column: crate::catalog::Column) -> Result<()> {
-        let table_def = self.catalog.get_mut(table)?;
+    fn add_column(&mut self, table: &str, mut column: crate::catalog::Column) -> Result<()> {
+        if column.primary_key {
+            column.nullable = false;
+            column.unique = true;
+        }
+        let table_def = self.catalog.get(table)?;
         if table_def.columns.iter().any(|c| c.name == column.name) {
             return Err(Error::schema(format!(
                 "column `{}` already exists in `{}`",
@@ -217,13 +224,22 @@ impl Engine for MemoryEngine {
             Some(e) => crate::executor::expr::eval(e)?,
             None => crate::types::value::Value::Null,
         };
+        let default = column.validate(default)?;
         if !column.nullable && default.is_null() {
             return Err(Error::constraint(format!(
                 "column `{}` is NOT NULL but has no default — refuse to fill existing rows with NULL",
                 column.name
             )));
         }
+        let row_count = self.data.get(table).map_or(0, |rows| rows.len());
+        if (column.primary_key || column.unique) && !default.is_null() && row_count > 1 {
+            return Err(Error::constraint(format!(
+                "duplicate value for unique column `{}`: {}",
+                column.name, default
+            )));
+        }
         // Update schema.
+        let table_def = self.catalog.get_mut(table)?;
         if column.primary_key {
             let idx = table_def.columns.len();
             table_def.primary_key = Some(idx);
@@ -247,11 +263,17 @@ mod tests {
     use crate::types::value::Value;
 
     fn users_table() -> Table {
-        Table::new("users", vec![
-            Column::new("id", DataType::Integer).primary_key(),
-            Column::new("name", DataType::String).not_null(),
-            Column::new("email", DataType::String).unique().nullable(true),
-        ]).unwrap()
+        Table::new(
+            "users",
+            vec![
+                Column::new("id", DataType::Integer).primary_key(),
+                Column::new("name", DataType::String).not_null(),
+                Column::new("email", DataType::String)
+                    .unique()
+                    .nullable(true),
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -281,7 +303,8 @@ mod tests {
     fn pk_uniqueness_enforced() {
         let mut e = MemoryEngine::new();
         e.create_table(users_table()).unwrap();
-        e.insert("users", Row(vec![1.into(), "alice".into(), Value::Null])).unwrap();
+        e.insert("users", Row(vec![1.into(), "alice".into(), Value::Null]))
+            .unwrap();
         let err = e
             .insert("users", Row(vec![1.into(), "bob".into(), Value::Null]))
             .unwrap_err();
@@ -292,7 +315,8 @@ mod tests {
     fn unique_column_enforced() {
         let mut e = MemoryEngine::new();
         e.create_table(users_table()).unwrap();
-        e.insert("users", Row(vec![1.into(), "a".into(), "x@x".into()])).unwrap();
+        e.insert("users", Row(vec![1.into(), "a".into(), "x@x".into()]))
+            .unwrap();
         let err = e
             .insert("users", Row(vec![2.into(), "b".into(), "x@x".into()]))
             .unwrap_err();
@@ -303,8 +327,10 @@ mod tests {
     fn null_unique_does_not_collide() {
         let mut e = MemoryEngine::new();
         e.create_table(users_table()).unwrap();
-        e.insert("users", Row(vec![1.into(), "a".into(), Value::Null])).unwrap();
-        e.insert("users", Row(vec![2.into(), "b".into(), Value::Null])).unwrap();
+        e.insert("users", Row(vec![1.into(), "a".into(), Value::Null]))
+            .unwrap();
+        e.insert("users", Row(vec![2.into(), "b".into(), Value::Null]))
+            .unwrap();
         assert_eq!(e.scan("users").unwrap().len(), 2);
     }
 
@@ -335,7 +361,12 @@ mod tests {
         let id = e
             .insert("users", Row(vec![1.into(), "alice".into(), "a@x".into()]))
             .unwrap();
-        e.update("users", id, Row(vec![1.into(), "alice".into(), "z@z".into()])).unwrap();
+        e.update(
+            "users",
+            id,
+            Row(vec![1.into(), "alice".into(), "z@z".into()]),
+        )
+        .unwrap();
         let v = e.scan("users").unwrap();
         assert_eq!(v[0].1[2], Value::String("z@z".into()));
     }
@@ -351,7 +382,11 @@ mod tests {
             .insert("users", Row(vec![2.into(), "bob".into(), Value::Null]))
             .unwrap();
         let err = e
-            .update("users", id1, Row(vec![2.into(), "alice".into(), Value::Null]))
+            .update(
+                "users",
+                id1,
+                Row(vec![2.into(), "alice".into(), Value::Null]),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("duplicate"));
     }
@@ -372,7 +407,8 @@ mod tests {
     fn drop_table_removes_data() {
         let mut e = MemoryEngine::new();
         e.create_table(users_table()).unwrap();
-        e.insert("users", Row(vec![1.into(), "alice".into(), Value::Null])).unwrap();
+        e.insert("users", Row(vec![1.into(), "alice".into(), Value::Null]))
+            .unwrap();
         assert!(e.drop_table("users", false).unwrap());
         assert!(e.list_tables().is_empty());
         assert!(e.get_table("users").is_err());

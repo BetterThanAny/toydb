@@ -25,7 +25,14 @@ pub struct Column {
 
 impl Column {
     pub fn new(name: impl Into<String>, ty: DataType) -> Self {
-        Self { name: name.into(), ty, primary_key: false, nullable: true, unique: false, default: None }
+        Self {
+            name: name.into(),
+            ty,
+            primary_key: false,
+            nullable: true,
+            unique: false,
+            default: None,
+        }
     }
 
     pub fn primary_key(mut self) -> Self {
@@ -35,10 +42,22 @@ impl Column {
         self
     }
 
-    pub fn not_null(mut self) -> Self { self.nullable = false; self }
-    pub fn unique(mut self) -> Self { self.unique = true; self }
-    pub fn nullable(mut self, n: bool) -> Self { self.nullable = n; self }
-    pub fn default_value(mut self, e: Expression) -> Self { self.default = Some(e); self }
+    pub fn not_null(mut self) -> Self {
+        self.nullable = false;
+        self
+    }
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+    pub fn nullable(mut self, n: bool) -> Self {
+        self.nullable = n;
+        self
+    }
+    pub fn default_value(mut self, e: Expression) -> Self {
+        self.default = Some(e);
+        self
+    }
 
     /// Validate a value against this column's constraints. Coerces it
     /// into the column's declared type (so `INTEGER` columns happily
@@ -46,7 +65,10 @@ impl Column {
     pub fn validate(&self, value: Value) -> Result<Value> {
         if value.is_null() {
             if !self.nullable {
-                return Err(Error::constraint(format!("column `{}` is NOT NULL", self.name)));
+                return Err(Error::constraint(format!(
+                    "column `{}` is NOT NULL",
+                    self.name
+                )));
             }
             return Ok(Value::Null);
         }
@@ -61,7 +83,7 @@ impl From<&ColumnDef> for Column {
             name: def.name.clone(),
             ty: def.ty,
             primary_key: def.primary_key,
-            nullable: def.nullable,
+            nullable: def.nullable && !def.primary_key,
             unique: def.unique || def.primary_key,
             default: def.default.clone(),
         }
@@ -78,13 +100,15 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn new(name: impl Into<String>, columns: Vec<Column>) -> Result<Self> {
+    pub fn new(name: impl Into<String>, mut columns: Vec<Column>) -> Result<Self> {
         let name = name.into();
         if name.is_empty() {
             return Err(Error::schema("table name must not be empty"));
         }
         if columns.is_empty() {
-            return Err(Error::schema(format!("table `{name}` must declare at least one column")));
+            return Err(Error::schema(format!(
+                "table `{name}` must declare at least one column"
+            )));
         }
         // Reject duplicate column names (case-sensitive).
         for i in 0..columns.len() {
@@ -97,14 +121,29 @@ impl Table {
                 }
             }
         }
-        let pks: Vec<usize> = columns.iter().enumerate().filter(|(_, c)| c.primary_key).map(|(i, _)| i).collect();
+        for col in &mut columns {
+            if col.primary_key {
+                col.nullable = false;
+                col.unique = true;
+            }
+        }
+        let pks: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key)
+            .map(|(i, _)| i)
+            .collect();
         if pks.len() > 1 {
             return Err(Error::schema(format!(
                 "table `{name}` has more than one PRIMARY KEY"
             )));
         }
         let primary_key = pks.into_iter().next();
-        Ok(Self { name, columns, primary_key })
+        Ok(Self {
+            name,
+            columns,
+            primary_key,
+        })
     }
 
     /// Look up a column index by name. Case-sensitive.
@@ -132,10 +171,14 @@ mod tests {
 
     #[test]
     fn build_simple_table() {
-        let t = Table::new("users", vec![
-            col("id", DataType::Integer).primary_key(),
-            col("name", DataType::String).not_null(),
-        ]).unwrap();
+        let t = Table::new(
+            "users",
+            vec![
+                col("id", DataType::Integer).primary_key(),
+                col("name", DataType::String).not_null(),
+            ],
+        )
+        .unwrap();
         assert_eq!(t.primary_key, Some(0));
         assert_eq!(t.column_index("name").unwrap(), 1);
         assert!(t.column_index("missing").is_err());
@@ -148,17 +191,27 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_columns() {
-        let r = Table::new("t", vec![col("a", DataType::Integer), col("a", DataType::String)]);
+        let r = Table::new(
+            "t",
+            vec![col("a", DataType::Integer), col("a", DataType::String)],
+        );
         assert!(r.unwrap_err().to_string().contains("duplicate"));
     }
 
     #[test]
     fn rejects_multiple_primary_keys() {
-        let r = Table::new("t", vec![
-            col("a", DataType::Integer).primary_key(),
-            col("b", DataType::Integer).primary_key(),
-        ]);
-        assert!(r.unwrap_err().to_string().contains("more than one PRIMARY KEY"));
+        let r = Table::new(
+            "t",
+            vec![
+                col("a", DataType::Integer).primary_key(),
+                col("b", DataType::Integer).primary_key(),
+            ],
+        );
+        assert!(
+            r.unwrap_err()
+                .to_string()
+                .contains("more than one PRIMARY KEY")
+        );
     }
 
     #[test]

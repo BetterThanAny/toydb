@@ -48,14 +48,14 @@ cargo run --release -- examples/txn.sql
 
 | Suite | Count | What it covers |
 |---|---|---|
-| unit (in `src/`) | ~211 | Lexer, parser, expr evaluator, aggregate folding, page/pager/wal, memory & disk engines, executor, format |
-| `tests/sql_basic.rs` | 7 | end-to-end CRUD, NULL semantics, unique constraint propagation |
+| unit (in `src/`) | ~225 | Lexer, parser, expr evaluator, aggregate folding, page/pager/wal, memory & disk engines, executor, format |
+| `tests/sql_basic.rs` | 16 | end-to-end CRUD, NULL semantics, unique constraint propagation, mutation error paths |
 | `tests/sql_comprehensive.rs` | 2 | "kitchen sink" queries spanning many features |
-| `tests/sql_persistence.rs` | 5 | open/close/reopen, multi-page tables, drop survival, WAL |
+| `tests/sql_persistence.rs` | 7 | open/close/reopen, multi-page tables, drop survival, WAL, failed update atomicity |
 | `tests/sql_stress.rs` | 4 | 5 k row inserts, 2 k×2 k join, 50× repeated update, disk round-trip |
 | `tests/sql_transaction.rs` | 8 | BEGIN/COMMIT/ROLLBACK semantics, nested-begin rejection, in-tx visibility |
 
-Total: **237 tests**, all passing, zero clippy warnings.
+Total: **262 tests**, all passing, zero clippy warnings.
 
 ## Project size
 
@@ -66,7 +66,8 @@ Total: **237 tests**, all passing, zero clippy warnings.
 
 ## Limitations (intentional)
 
-- No subqueries, CTEs, window functions, or `UNION`.
+- No correlated subqueries, CTEs, or window functions. Uncorrelated scalar
+  subqueries and `UNION` / `UNION ALL` are supported.
 - No real query optimisation: every join is nested-loop, no indexes.
 - No replication / sharding / consensus.
 - Toydb is single-threaded — concurrent transactions can't interleave.
