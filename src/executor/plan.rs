@@ -618,19 +618,31 @@ impl<'a> Executor<'a> {
         rows: Vec<Row>,
         aggs: Vec<(AggKey, AggSpec)>,
     ) -> Result<ResultSet> {
-        // Validate that non-aggregate SELECT items refer only to GROUP BY
-        // expressions or constants.
+        // Validate that every non-aggregate column reference in SELECT,
+        // HAVING, and ORDER BY is backed by a GROUP BY key. Aggregate
+        // arguments are folded per input row and are therefore exempt here.
+        let select_aliases: HashMap<&str, &Expression> = s
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::Expr {
+                    expr,
+                    alias: Some(a),
+                } => Some((a.as_str(), expr)),
+                _ => None,
+            })
+            .collect();
         for item in &s.items {
             if let SelectItem::Expr { expr, .. } = item {
-                let mut local = Vec::new();
-                collect_aggregates(expr, &mut local)?;
-                if local.is_empty() && !s.group_by.iter().any(|g| g == expr) && !is_constant(expr) {
-                    return Err(Error::other(format!(
-                        "non-aggregate item {} is not in GROUP BY",
-                        describe_expr(expr)
-                    )));
-                }
+                validate_grouped_expr(expr, &s.group_by)?;
             }
+        }
+        if let Some(having) = &s.having {
+            validate_grouped_expr(having, &s.group_by)?;
+        }
+        for ob in &s.order_by {
+            let rewritten = rewrite_aliases(&ob.expr, &select_aliases);
+            validate_grouped_expr(&rewritten, &s.group_by)?;
         }
 
         // Group rows.
@@ -720,21 +732,17 @@ impl<'a> Executor<'a> {
             let accs = groups.get(key).expect("key from order list");
             let finals: Vec<Value> = accs.iter().map(|a| a.finalize()).collect();
 
-            // Pick a representative row for resolving non-aggregate columns.
-            // For non-empty groups we use the first matching row scanned.
-            // For empty groups (no rows) we error if any non-aggregate
-            // column is referenced — unless the group key fully covers it,
-            // in which case the group key itself provides values.
+            // Grouped evaluation must resolve non-aggregate columns only
+            // from the group key. It must not fall back to an arbitrary
+            // representative row.
             let rep_resolver = GroupedResolver {
-                schema,
-                rep_row: representative_row(&rows, &s.group_by, schema, key)?,
                 key,
                 group_by: &s.group_by,
             };
 
             // HAVING.
             if let Some(having) = &s.having {
-                match eval_in_group(having, &aggs, &finals, &rep_resolver)? {
+                match eval_grouped_expr(having, key, &s.group_by, &aggs, &finals, &rep_resolver)? {
                     Value::Boolean(true) => {}
                     Value::Boolean(false) | Value::Null => continue,
                     other => {
@@ -752,27 +760,30 @@ impl<'a> Executor<'a> {
                 let SelectItem::Expr { expr, .. } = item else {
                     return Err(Error::other("`*` in aggregated SELECT is unsupported"));
                 };
-                row.push(eval_in_group(expr, &aggs, &finals, &rep_resolver)?);
+                row.push(eval_grouped_expr(
+                    expr,
+                    key,
+                    &s.group_by,
+                    &aggs,
+                    &finals,
+                    &rep_resolver,
+                )?);
             }
 
             // ORDER BY keys. SELECT aliases (`AS total`) take priority
             // when they appear bare in ORDER BY — that matches Postgres
             // and SQLite. We substitute by walking the expression.
-            let select_aliases: HashMap<&str, &Expression> = s
-                .items
-                .iter()
-                .filter_map(|i| match i {
-                    SelectItem::Expr {
-                        expr,
-                        alias: Some(a),
-                    } => Some((a.as_str(), expr)),
-                    _ => None,
-                })
-                .collect();
             let mut sort_keys = Vec::new();
             for ob in &s.order_by {
                 let rewritten = rewrite_aliases(&ob.expr, &select_aliases);
-                sort_keys.push(eval_in_group(&rewritten, &aggs, &finals, &rep_resolver)?);
+                sort_keys.push(eval_grouped_expr(
+                    &rewritten,
+                    key,
+                    &s.group_by,
+                    &aggs,
+                    &finals,
+                    &rep_resolver,
+                )?);
             }
             emitted.push(Emitted {
                 sort_keys,
@@ -1030,11 +1041,9 @@ impl<'a> Resolver for WideResolver<'a> {
     }
 }
 
-/// Resolver used inside grouped projection. Falls back to a chosen
-/// representative row for non-aggregate column references.
+/// Resolver used inside grouped projection. Non-aggregate columns resolve
+/// only when the column itself is a GROUP BY key.
 struct GroupedResolver<'a> {
-    schema: &'a WideSchema,
-    rep_row: Option<&'a Row>,
     key: &'a GroupKey,
     group_by: &'a [Expression],
 }
@@ -1050,15 +1059,7 @@ impl<'a> Resolver for GroupedResolver<'a> {
                 return Ok(self.key.0[i].clone());
             }
         }
-        match self.rep_row {
-            Some(r) => {
-                let i = self.schema.lookup(name)?;
-                Ok(r.0[i].clone())
-            }
-            None => Err(Error::schema(format!(
-                "column `{name}` is not in GROUP BY and no rows are available"
-            ))),
-        }
+        Err(Error::schema(format!("column `{name}` is not in GROUP BY")))
     }
     fn qualified(&self, table: &str, name: &str) -> Result<Value> {
         for (i, g) in self.group_by.iter().enumerate() {
@@ -1069,38 +1070,10 @@ impl<'a> Resolver for GroupedResolver<'a> {
                 return Ok(self.key.0[i].clone());
             }
         }
-        match self.rep_row {
-            Some(r) => {
-                let i = self.schema.lookup_qualified(table, name)?;
-                Ok(r.0[i].clone())
-            }
-            None => Err(Error::schema(format!(
-                "column `{table}.{name}` is not in GROUP BY and no rows are available"
-            ))),
-        }
+        Err(Error::schema(format!(
+            "column `{table}.{name}` is not in GROUP BY"
+        )))
     }
-}
-
-fn representative_row<'a>(
-    rows: &'a [Row],
-    group_by: &[Expression],
-    schema: &WideSchema,
-    key: &GroupKey,
-) -> Result<Option<&'a Row>> {
-    if group_by.is_empty() {
-        return Ok(rows.first());
-    }
-    for r in rows {
-        let resolver = WideResolver { schema, row: r };
-        let mut k = Vec::with_capacity(group_by.len());
-        for g in group_by {
-            k.push(eval_with(g, &resolver)?);
-        }
-        if GroupKey(k) == *key {
-            return Ok(Some(r));
-        }
-    }
-    Ok(None)
 }
 
 // ---------------------------------------------------------------------
@@ -1410,12 +1383,194 @@ fn describe_expr(e: &Expression) -> String {
     }
 }
 
-fn is_constant(e: &Expression) -> bool {
-    match e {
-        Expression::Literal(_) => true,
-        Expression::Unary(_, inner) => is_constant(inner),
-        Expression::Binary(l, _, r) => is_constant(l) && is_constant(r),
-        _ => false,
+fn validate_grouped_expr(expr: &Expression, group_by: &[Expression]) -> Result<()> {
+    validate_grouped_expr_inner(expr, group_by, true)
+}
+
+fn validate_grouped_expr_inner(
+    expr: &Expression,
+    group_by: &[Expression],
+    allow_exact_group_key: bool,
+) -> Result<()> {
+    if allow_exact_group_key && group_by.iter().any(|g| g == expr) {
+        return Ok(());
+    }
+    match expr {
+        Expression::Literal(_) | Expression::Wildcard | Expression::Scalar(_) => Ok(()),
+        Expression::Column(_) | Expression::Qualified(_, _) => {
+            if group_by.iter().any(|g| g == expr) {
+                Ok(())
+            } else {
+                Err(Error::other(format!(
+                    "non-aggregate item {} is not in GROUP BY",
+                    describe_expr(expr)
+                )))
+            }
+        }
+        Expression::Unary(_, inner) => validate_grouped_expr_inner(inner, group_by, false),
+        Expression::Binary(l, _, r) => {
+            validate_grouped_expr_inner(l, group_by, true)?;
+            validate_grouped_expr_inner(r, group_by, true)
+        }
+        Expression::IsNull { expr, .. } => validate_grouped_expr_inner(expr, group_by, true),
+        Expression::InList { expr, list, .. } => {
+            validate_grouped_expr_inner(expr, group_by, true)?;
+            for item in list {
+                validate_grouped_expr_inner(item, group_by, true)?;
+            }
+            Ok(())
+        }
+        Expression::Between {
+            expr, low, high, ..
+        } => {
+            validate_grouped_expr_inner(expr, group_by, true)?;
+            validate_grouped_expr_inner(low, group_by, true)?;
+            validate_grouped_expr_inner(high, group_by, true)
+        }
+        Expression::Like { expr, pattern, .. } => {
+            validate_grouped_expr_inner(expr, group_by, true)?;
+            validate_grouped_expr_inner(pattern, group_by, true)
+        }
+        Expression::Function { name, args, .. } => {
+            if aggregate_kind(name).is_some() {
+                return Ok(());
+            }
+            for arg in args {
+                validate_grouped_expr_inner(arg, group_by, true)?;
+            }
+            Ok(())
+        }
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(operand) = operand {
+                validate_grouped_expr_inner(operand, group_by, true)?;
+            }
+            for (when, then) in branches {
+                validate_grouped_expr_inner(when, group_by, true)?;
+                validate_grouped_expr_inner(then, group_by, true)?;
+            }
+            if let Some(otherwise) = otherwise {
+                validate_grouped_expr_inner(otherwise, group_by, true)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn eval_grouped_expr<R: Resolver + ?Sized>(
+    expr: &Expression,
+    key: &GroupKey,
+    group_by: &[Expression],
+    aggs: &[(AggKey, AggSpec)],
+    finals: &[Value],
+    resolver: &R,
+) -> Result<Value> {
+    if let Some((i, _)) = group_by.iter().enumerate().find(|(_, g)| *g == expr) {
+        return Ok(key.0[i].clone());
+    }
+    let rewritten = rewrite_group_keys(expr, key, group_by);
+    eval_in_group(&rewritten, aggs, finals, resolver)
+}
+
+fn rewrite_group_keys(expr: &Expression, key: &GroupKey, group_by: &[Expression]) -> Expression {
+    if let Some((i, _)) = group_by.iter().enumerate().find(|(_, g)| *g == expr) {
+        return Expression::Literal(literal_for_value(key.0[i].clone()));
+    }
+    match expr {
+        Expression::Column(_)
+        | Expression::Qualified(_, _)
+        | Expression::Literal(_)
+        | Expression::Wildcard
+        | Expression::Scalar(_) => expr.clone(),
+        Expression::Unary(op, inner) => {
+            Expression::Unary(*op, Box::new(rewrite_group_keys(inner, key, group_by)))
+        }
+        Expression::Binary(l, op, r) => Expression::Binary(
+            Box::new(rewrite_group_keys(l, key, group_by)),
+            *op,
+            Box::new(rewrite_group_keys(r, key, group_by)),
+        ),
+        Expression::IsNull { expr, negated } => Expression::IsNull {
+            expr: Box::new(rewrite_group_keys(expr, key, group_by)),
+            negated: *negated,
+        },
+        Expression::InList {
+            expr,
+            list,
+            negated,
+        } => Expression::InList {
+            expr: Box::new(rewrite_group_keys(expr, key, group_by)),
+            list: list
+                .iter()
+                .map(|e| rewrite_group_keys(e, key, group_by))
+                .collect(),
+            negated: *negated,
+        },
+        Expression::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expression::Between {
+            expr: Box::new(rewrite_group_keys(expr, key, group_by)),
+            low: Box::new(rewrite_group_keys(low, key, group_by)),
+            high: Box::new(rewrite_group_keys(high, key, group_by)),
+            negated: *negated,
+        },
+        Expression::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expression::Like {
+            expr: Box::new(rewrite_group_keys(expr, key, group_by)),
+            pattern: Box::new(rewrite_group_keys(pattern, key, group_by)),
+            negated: *negated,
+        },
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } if aggregate_kind(name).is_some() => Expression::Function {
+            name: name.clone(),
+            args: args.clone(),
+            distinct: *distinct,
+        },
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } => Expression::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_group_keys(a, key, group_by))
+                .collect(),
+            distinct: *distinct,
+        },
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => Expression::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(rewrite_group_keys(e, key, group_by))),
+            branches: branches
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        rewrite_group_keys(w, key, group_by),
+                        rewrite_group_keys(t, key, group_by),
+                    )
+                })
+                .collect(),
+            otherwise: otherwise
+                .as_ref()
+                .map(|e| Box::new(rewrite_group_keys(e, key, group_by))),
+        },
     }
 }
 
@@ -1819,6 +1974,61 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not in GROUP BY"));
+    }
+
+    #[test]
+    fn mixed_aggregate_expression_rejects_ungrouped_column() {
+        let mut e = MemoryEngine::new();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (a INT, b INT);
+            INSERT INTO t VALUES (1, 10), (1, 20);
+        ",
+        );
+        let err = run(&mut e, "SELECT a + SUM(b) FROM t GROUP BY b").unwrap_err();
+        assert!(err.to_string().contains("not in GROUP BY"));
+    }
+
+    #[test]
+    fn having_and_order_by_reject_ungrouped_columns() {
+        let mut e = MemoryEngine::new();
+        setup_orders(&mut e);
+
+        let err = run(
+            &mut e,
+            "SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING status = 'paid'",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not in GROUP BY"));
+
+        let err = run(
+            &mut e,
+            "SELECT customer, COUNT(*) FROM orders GROUP BY customer ORDER BY status",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not in GROUP BY"));
+    }
+
+    #[test]
+    fn grouped_expression_can_be_used_in_having_and_order_by() {
+        let mut e = MemoryEngine::new();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (a INT, b INT);
+            INSERT INTO t VALUES (1, 10), (2, 20), (2, 30);
+        ",
+        );
+        let r = run(
+            &mut e,
+            "SELECT a + 1, SUM(b) FROM t GROUP BY a + 1 HAVING a + 1 > 2 ORDER BY a + 1",
+        )
+        .unwrap();
+        let rows = assert_select(&r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(3));
+        assert_eq!(rows[0][1], Value::Integer(50));
     }
 
     // ----- joins -------------------------------------------------------

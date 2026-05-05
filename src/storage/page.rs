@@ -17,7 +17,9 @@
 //! Free space is everything between `slot_dir_end` and `free_offset`.
 //!
 //! Tombstoned slots have `record_len == 0` so iteration knows to skip
-//! them; reuse on next write that fits.
+//! them. Their slot offset stores the old record offset and capacity,
+//! allowing a future insert that fits to reuse the dead record space in
+//! place without moving the page free-space pointer.
 
 use crate::error::{Error, Result};
 
@@ -132,9 +134,13 @@ impl Page {
     pub fn insert(&mut self, data: &[u8]) -> Result<u16> {
         // Try to reuse a tombstone slot first.
         for i in 0..self.slot_count() {
-            let (_, len) = self.slot(i as usize);
-            if len == 0 && self.free_space_for_existing_slot() >= data.len() {
-                return self.write_into_slot(i as usize, data);
+            let (off, len) = self.slot(i as usize);
+            if len == 0
+                && let Some((record_off, capacity)) = tombstone_info(off)
+                && data.len() <= capacity
+            {
+                self.write_in_place(i as usize, record_off, data);
+                return Ok(i as u16);
             }
         }
         if self.free_space() < data.len() {
@@ -172,9 +178,15 @@ impl Page {
             return Ok(());
         }
 
-        let (_, len) = self.slot(slot_idx);
+        let (off, len) = self.slot(slot_idx);
         if len != 0 {
             return Err(Error::other(format!("slot {slot} is occupied")));
+        }
+        if let Some((record_off, capacity)) = tombstone_info(off)
+            && data.len() <= capacity
+        {
+            self.write_in_place(slot_idx, record_off, data);
+            return Ok(());
         }
         if self.free_space_for_existing_slot() < data.len() {
             return Err(Error::other(format!(
@@ -193,7 +205,12 @@ impl Page {
         if slot as u32 >= self.slot_count() {
             return Err(Error::other(format!("slot {slot} out of range")));
         }
+        let (off, len) = self.slot(slot as usize);
+        if len == 0 {
+            return Ok(());
+        }
         let dir_off = HEADER_SIZE + (slot as usize) * SLOT_SIZE;
+        write_u32(&mut self.buf[..], dir_off, pack_tombstone(off, len));
         write_u32(&mut self.buf[..], dir_off + 4, 0); // record_len = 0
         Ok(())
     }
@@ -281,10 +298,34 @@ impl Page {
         Ok(slot_idx as u16)
     }
 
+    fn write_in_place(&mut self, slot_idx: usize, off: u32, data: &[u8]) {
+        let start = off as usize;
+        self.buf[start..start + data.len()].copy_from_slice(data);
+        let dir_off = HEADER_SIZE + slot_idx * SLOT_SIZE;
+        write_u32(&mut self.buf[..], dir_off, off);
+        write_u32(&mut self.buf[..], dir_off + 4, data.len() as u32);
+    }
+
     fn free_space_for_existing_slot(&self) -> usize {
         let slot_end = HEADER_SIZE + (self.slot_count() as usize) * SLOT_SIZE;
         let free_off = self.free_offset() as usize;
         free_off.saturating_sub(slot_end)
+    }
+}
+
+fn pack_tombstone(off: u32, capacity: u32) -> u32 {
+    debug_assert!(off <= u16::MAX as u32);
+    debug_assert!(capacity <= u16::MAX as u32);
+    (capacity << 16) | off
+}
+
+fn tombstone_info(raw_off: u32) -> Option<(u32, usize)> {
+    let capacity = raw_off >> 16;
+    let off = raw_off & u16::MAX as u32;
+    if capacity == 0 {
+        None
+    } else {
+        Some((off, capacity as usize))
     }
 }
 
@@ -399,6 +440,22 @@ mod tests {
         // Should reuse slot 0 (tombstoned) since smaller record fits.
         assert_eq!(s2, 0);
         assert_eq!(p.get(s2), Some(&b"vw"[..]));
+    }
+
+    #[test]
+    fn tombstone_reuse_does_not_need_contiguous_free_space() {
+        let mut p = Page::new(PageType::TableData);
+        let payload = vec![b'x'; p.free_space() - 64];
+        let s0 = p.insert(&payload).unwrap();
+        assert!(p.free_space() < payload.len());
+
+        p.delete(s0).unwrap();
+        let free_offset = p.free_offset();
+        let s1 = p.insert(b"small").unwrap();
+
+        assert_eq!(s1, s0);
+        assert_eq!(p.free_offset(), free_offset);
+        assert_eq!(p.get(s1), Some(&b"small"[..]));
     }
 
     #[test]
