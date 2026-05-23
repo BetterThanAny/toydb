@@ -14,6 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::catalog::Index;
 use crate::engine::RowId;
 use crate::error::{Error, Result};
 use crate::storage::encoding::{decode_row, decode_table, encode_row, encode_table};
@@ -25,6 +26,10 @@ pub enum LogRecord {
     CreateTable(crate::catalog::Table),
     /// `DROP TABLE`.
     DropTable(String),
+    /// `CREATE INDEX`.
+    CreateIndex(Index),
+    /// `DROP INDEX`.
+    DropIndex(String),
     /// `INSERT` returned this row id.
     Insert { table: String, id: RowId, row: Row },
     /// `UPDATE` of an existing row.
@@ -91,11 +96,17 @@ impl Wal {
 
     pub fn truncate(&mut self) -> Result<()> {
         self.file.set_len(0)?;
-        self.file = OpenOptions::new().read(true).append(true).create(true).open(&self.path)?;
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&self.path)?;
         Ok(())
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -110,6 +121,16 @@ fn encode_record(rec: &LogRecord, out: &mut Vec<u8>) {
         }
         LogRecord::DropTable(name) => {
             out.push(2);
+            encode_string(name, out);
+        }
+        LogRecord::CreateIndex(index) => {
+            out.push(6);
+            encode_string(&index.name, out);
+            encode_string(&index.table, out);
+            encode_string(&index.column, out);
+        }
+        LogRecord::DropIndex(name) => {
+            out.push(7);
             encode_string(name, out);
         }
         LogRecord::Insert { table, id, row } => {
@@ -137,6 +158,12 @@ fn decode_record(r: &mut &[u8]) -> Result<LogRecord> {
     Ok(match tag {
         1 => LogRecord::CreateTable(decode_table(r)?),
         2 => LogRecord::DropTable(decode_string(r)?),
+        6 => LogRecord::CreateIndex(Index::new(
+            decode_string(r)?,
+            decode_string(r)?,
+            decode_string(r)?,
+        )?),
+        7 => LogRecord::DropIndex(decode_string(r)?),
         3 => LogRecord::Insert {
             table: decode_string(r)?,
             id: take_u64(r)?,
@@ -163,29 +190,37 @@ fn encode_string(s: &str, w: &mut Vec<u8>) {
 
 fn decode_string(r: &mut &[u8]) -> Result<String> {
     let n = take_u32(r)? as usize;
-    if r.len() < n { return Err(Error::other("WAL: truncated string")); }
-    let s = String::from_utf8(r[..n].to_vec())
-        .map_err(|e| Error::other(format!("WAL utf-8: {e}")))?;
+    if r.len() < n {
+        return Err(Error::other("WAL: truncated string"));
+    }
+    let s =
+        String::from_utf8(r[..n].to_vec()).map_err(|e| Error::other(format!("WAL utf-8: {e}")))?;
     *r = &r[n..];
     Ok(s)
 }
 
 fn take_u8(r: &mut &[u8]) -> Result<u8> {
-    if r.is_empty() { return Err(Error::other("WAL: truncated u8")); }
+    if r.is_empty() {
+        return Err(Error::other("WAL: truncated u8"));
+    }
     let b = r[0];
     *r = &r[1..];
     Ok(b)
 }
 
 fn take_u32(r: &mut &[u8]) -> Result<u32> {
-    if r.len() < 4 { return Err(Error::other("WAL: truncated u32")); }
+    if r.len() < 4 {
+        return Err(Error::other("WAL: truncated u32"));
+    }
     let arr: [u8; 4] = r[..4].try_into().unwrap();
     *r = &r[4..];
     Ok(u32::from_le_bytes(arr))
 }
 
 fn take_u64(r: &mut &[u8]) -> Result<u64> {
-    if r.len() < 8 { return Err(Error::other("WAL: truncated u64")); }
+    if r.len() < 8 {
+        return Err(Error::other("WAL: truncated u64"));
+    }
     let arr: [u8; 8] = r[..8].try_into().unwrap();
     *r = &r[8..];
     Ok(u64::from_le_bytes(arr))
@@ -241,13 +276,19 @@ mod tests {
                 table: "t".into(),
                 id: 7,
                 row: Row(vec![Value::Integer(42)]),
-            }).unwrap();
+            })
+            .unwrap();
             w.append(&LogRecord::Update {
                 table: "t".into(),
                 id: 7,
                 row: Row(vec![Value::Integer(100)]),
-            }).unwrap();
-            w.append(&LogRecord::Delete { table: "t".into(), id: 7 }).unwrap();
+            })
+            .unwrap();
+            w.append(&LogRecord::Delete {
+                table: "t".into(),
+                id: 7,
+            })
+            .unwrap();
         }
         let mut w = Wal::open(&path).unwrap();
         let recs = w.replay().unwrap();
@@ -256,11 +297,36 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_index_ddl() {
+        let path = tmppath();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.append(&LogRecord::CreateIndex(
+                Index::new("idx_t_a", "t", "a").unwrap(),
+            ))
+            .unwrap();
+            w.append(&LogRecord::DropIndex("idx_t_a".into())).unwrap();
+        }
+        let mut w = Wal::open(&path).unwrap();
+        let recs = w.replay().unwrap();
+        assert_eq!(recs.len(), 2);
+        match &recs[0] {
+            LogRecord::CreateIndex(index) => assert_eq!(index.column, "a"),
+            _ => panic!(),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn truncated_tail_is_ignored() {
         let path = tmppath();
         {
             let mut w = Wal::open(&path).unwrap();
-            w.append(&LogRecord::Delete { table: "t".into(), id: 7 }).unwrap();
+            w.append(&LogRecord::Delete {
+                table: "t".into(),
+                id: 7,
+            })
+            .unwrap();
         }
         // Append a partial header (only 2 bytes — too short).
         OpenOptions::new()
@@ -281,7 +347,11 @@ mod tests {
         let path = tmppath();
         {
             let mut w = Wal::open(&path).unwrap();
-            w.append(&LogRecord::Delete { table: "t".into(), id: 1 }).unwrap();
+            w.append(&LogRecord::Delete {
+                table: "t".into(),
+                id: 1,
+            })
+            .unwrap();
             w.truncate().unwrap();
             assert_eq!(w.replay().unwrap(), vec![]);
         }

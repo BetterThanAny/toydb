@@ -37,7 +37,10 @@ fn memory_handles_5k_rows() {
     eprintln!("inserted 5k rows in {:?}", elapsed);
 
     let t1 = Instant::now();
-    let r = run(&mut e, "SELECT COUNT(*), SUM(n) FROM big WHERE n >= 100 AND n < 1000");
+    let r = run(
+        &mut e,
+        "SELECT COUNT(*), SUM(n) FROM big WHERE n >= 100 AND n < 1000",
+    );
     let elapsed = t1.elapsed();
     eprintln!("aggregate in {:?}", elapsed);
     match r {
@@ -61,7 +64,10 @@ fn memory_join_2k_x_2k() {
     );
     for i in 0..2000 {
         run(&mut e, &format!("INSERT INTO a VALUES ({i}, {})", i * 10));
-        run(&mut e, &format!("INSERT INTO b VALUES ({i}, {i}, {})", i % 7));
+        run(
+            &mut e,
+            &format!("INSERT INTO b VALUES ({i}, {i}, {})", i % 7),
+        );
     }
     let t = Instant::now();
     let r = run(
@@ -87,15 +93,24 @@ fn disk_handles_2k_rows_round_trip() {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let c = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("toydb-stress-{n}-{c}.db"));
     {
         let mut e = DiskEngine::open(&path).unwrap();
-        run_all(&mut e, "CREATE TABLE big (id INT PRIMARY KEY, n INT, s TEXT)");
+        run_all(
+            &mut e,
+            "CREATE TABLE big (id INT PRIMARY KEY, n INT, s TEXT)",
+        );
         let t = Instant::now();
         for i in 0..2000 {
-            run(&mut e, &format!("INSERT INTO big VALUES ({i}, {}, 'row{i}')", i * 2));
+            run(
+                &mut e,
+                &format!("INSERT INTO big VALUES ({i}, {}, 'row{i}')", i * 2),
+            );
         }
         eprintln!("disk insert 2k rows in {:?}", t.elapsed());
         e.checkpoint().unwrap();
@@ -120,10 +135,7 @@ fn disk_handles_2k_rows_round_trip() {
 #[test]
 fn repeated_update_consistent() {
     let mut e = MemoryEngine::new();
-    run_all(
-        &mut e,
-        "CREATE TABLE c (id INT PRIMARY KEY, v INT)",
-    );
+    run_all(&mut e, "CREATE TABLE c (id INT PRIMARY KEY, v INT)");
     for i in 0..100 {
         run(&mut e, &format!("INSERT INTO c VALUES ({i}, 0)"));
     }

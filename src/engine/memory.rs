@@ -6,15 +6,18 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::catalog::{Catalog, Table};
+use crate::catalog::{Catalog, Index, Table};
+use crate::engine::index::IndexStore;
 use crate::engine::{Engine, RowId};
 use crate::error::{Error, Result};
 use crate::types::row::Row;
+use crate::types::value::Value;
 
 #[derive(Debug, Default, Clone)]
 pub struct MemoryEngine {
     catalog: Catalog,
     data: HashMap<String, BTreeMap<RowId, Row>>,
+    indexes: IndexStore,
     next_id: RowId,
     /// Snapshot of `(catalog, data, next_id)` taken at `BEGIN`. On
     /// `ROLLBACK` we restore from it; on `COMMIT` we discard it.
@@ -25,6 +28,7 @@ pub struct MemoryEngine {
 struct Snapshot {
     catalog: Catalog,
     data: HashMap<String, BTreeMap<RowId, Row>>,
+    indexes: IndexStore,
     next_id: RowId,
 }
 
@@ -86,6 +90,9 @@ impl MemoryEngine {
 impl Engine for MemoryEngine {
     fn create_table(&mut self, table: Table) -> Result<()> {
         self.catalog.create_table(table.clone())?;
+        for index in &table.indexes {
+            self.indexes.rebuild(&index.name, std::iter::empty());
+        }
         self.data.insert(table.name, BTreeMap::new());
         Ok(())
     }
@@ -97,9 +104,34 @@ impl Engine for MemoryEngine {
             }
             return Err(Error::schema(format!("table `{name}` does not exist")));
         }
-        self.catalog.drop_table(name)?;
+        let table = self.catalog.drop_table(name)?;
+        for index in table.indexes {
+            self.indexes.drop(&index.name);
+        }
         self.data.remove(name);
         Ok(true)
+    }
+
+    fn create_index(&mut self, index: Index) -> Result<()> {
+        let col_idx = self
+            .catalog
+            .get(&index.table)?
+            .column_index(&index.column)?;
+        self.catalog.create_index(index.clone())?;
+        let entries = self
+            .data
+            .get(&index.table)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .map(|(id, row)| (row.0[col_idx].clone(), *id));
+        self.indexes.rebuild(&index.name, entries);
+        Ok(())
+    }
+
+    fn drop_index(&mut self, name: &str) -> Result<()> {
+        let index = self.catalog.drop_index(name)?;
+        self.indexes.drop(&index.name);
+        Ok(())
     }
 
     fn get_table(&self, name: &str) -> Result<&Table> {
@@ -119,7 +151,11 @@ impl Engine for MemoryEngine {
         self.data
             .get_mut(table)
             .ok_or_else(|| Error::internal("missing data storage"))?
-            .insert(id, row);
+            .insert(id, row.clone());
+        for index in &table_def.indexes {
+            let col_idx = table_def.column_index(&index.column)?;
+            self.indexes.insert(&index.name, &row.0[col_idx], id);
+        }
         Ok(id)
     }
 
@@ -140,28 +176,68 @@ impl Engine for MemoryEngine {
             .data
             .get_mut(table)
             .ok_or_else(|| Error::internal("missing data storage"))?;
-        if !store.contains_key(&id) {
+        let Some(old_row) = store.get(&id).cloned() else {
             return Err(Error::internal(format!(
                 "update target row {id} no longer exists"
             )));
+        };
+        store.insert(id, row.clone());
+        for index in &table_def.indexes {
+            let col_idx = table_def.column_index(&index.column)?;
+            self.indexes.remove(&index.name, &old_row.0[col_idx], id);
+            self.indexes.insert(&index.name, &row.0[col_idx], id);
         }
-        store.insert(id, row);
         Ok(())
     }
 
     fn delete(&mut self, table: &str, id: RowId) -> Result<()> {
-        let _ = self.catalog.get(table)?;
+        let table_def = self.catalog.get(table)?.clone();
         let store = self
             .data
             .get_mut(table)
             .ok_or_else(|| Error::internal("missing data storage"))?;
-        store.remove(&id);
+        if let Some(old_row) = store.remove(&id) {
+            for index in &table_def.indexes {
+                let col_idx = table_def.column_index(&index.column)?;
+                self.indexes.remove(&index.name, &old_row.0[col_idx], id);
+            }
+        }
         Ok(())
     }
 
     fn get(&mut self, table: &str, id: RowId) -> Result<Option<Row>> {
         let _ = self.catalog.get(table)?;
         Ok(self.data.get(table).and_then(|m| m.get(&id).cloned()))
+    }
+
+    fn lookup_index(
+        &mut self,
+        table: &str,
+        index: &str,
+        value: &Value,
+    ) -> Result<Vec<(RowId, Row)>> {
+        let meta = self
+            .catalog
+            .find_index(index)
+            .ok_or_else(|| Error::schema(format!("index `{index}` does not exist")))?;
+        if meta.table != table {
+            return Err(Error::schema(format!(
+                "index `{index}` belongs to `{}`, not `{table}`",
+                meta.table
+            )));
+        }
+        let Some(rows) = self.data.get(table) else {
+            return Err(Error::internal(format!(
+                "missing data storage for `{table}`"
+            )));
+        };
+        let out = self
+            .indexes
+            .lookup(index, value)
+            .into_iter()
+            .filter_map(|id| rows.get(&id).cloned().map(|row| (id, row)))
+            .collect();
+        Ok(out)
     }
 
     fn begin(&mut self) -> Result<()> {
@@ -171,6 +247,7 @@ impl Engine for MemoryEngine {
         self.snapshot = Some(Snapshot {
             catalog: self.catalog.clone(),
             data: self.data.clone(),
+            indexes: self.indexes.clone(),
             next_id: self.next_id,
         });
         Ok(())
@@ -190,6 +267,7 @@ impl Engine for MemoryEngine {
             Some(s) => {
                 self.catalog = s.catalog;
                 self.data = s.data;
+                self.indexes = s.indexes;
                 self.next_id = s.next_id;
                 Ok(())
             }

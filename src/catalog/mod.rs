@@ -6,7 +6,7 @@
 
 mod table;
 
-pub use table::{Column, Table};
+pub use table::{Column, Index, Table};
 
 use std::collections::BTreeMap;
 
@@ -20,11 +20,16 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn create_table(&mut self, table: Table) -> Result<()> {
         if self.tables.contains_key(&table.name) {
-            return Err(Error::schema(format!("table `{}` already exists", table.name)));
+            return Err(Error::schema(format!(
+                "table `{}` already exists",
+                table.name
+            )));
         }
         self.tables.insert(table.name.clone(), table);
         Ok(())
@@ -34,6 +39,36 @@ impl Catalog {
         self.tables
             .remove(name)
             .ok_or_else(|| Error::schema(format!("table `{name}` does not exist")))
+    }
+
+    pub fn create_index(&mut self, index: Index) -> Result<()> {
+        if self.index_exists(&index.name) {
+            return Err(Error::schema(format!(
+                "index `{}` already exists",
+                index.name
+            )));
+        }
+        let table = self.get_mut(&index.table)?;
+        table.add_index(index)
+    }
+
+    pub fn drop_index(&mut self, name: &str) -> Result<Index> {
+        for table in self.tables.values_mut() {
+            if let Some(index) = table.drop_index(name) {
+                return Ok(index);
+            }
+        }
+        Err(Error::schema(format!("index `{name}` does not exist")))
+    }
+
+    pub fn find_index(&self, name: &str) -> Option<&Index> {
+        self.tables
+            .values()
+            .find_map(|table| table.indexes.iter().find(|index| index.name == name))
+    }
+
+    pub fn index_exists(&self, name: &str) -> bool {
+        self.find_index(name).is_some()
     }
 
     pub fn get(&self, name: &str) -> Result<&Table> {
@@ -48,14 +83,24 @@ impl Catalog {
             .ok_or_else(|| Error::schema(format!("table `{name}` does not exist")))
     }
 
-    pub fn contains(&self, name: &str) -> bool { self.tables.contains_key(name) }
+    pub fn contains(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
+    }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &Table)> { self.tables.iter() }
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Table)> {
+        self.tables.iter()
+    }
 
-    pub fn names(&self) -> impl Iterator<Item = &String> { self.tables.keys() }
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.tables.keys()
+    }
 
-    pub fn len(&self) -> usize { self.tables.len() }
-    pub fn is_empty(&self) -> bool { self.tables.is_empty() }
+    pub fn len(&self) -> usize {
+        self.tables.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -67,7 +112,8 @@ mod tests {
         Table::new(
             name,
             vec![Column::new("id", DataType::Integer).primary_key()],
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     #[test]
@@ -94,5 +140,21 @@ mod tests {
         assert!(!c.contains("users"));
         assert!(c.drop_table("users").is_err());
         assert!(c.get("users").is_err());
+    }
+
+    #[test]
+    fn index_names_are_catalog_global() {
+        let mut c = Catalog::new();
+        c.create_table(t("users")).unwrap();
+        c.create_table(t("orders")).unwrap();
+        c.create_index(Index::new("idx_id", "users", "id").unwrap())
+            .unwrap();
+        let err = c
+            .create_index(Index::new("idx_id", "orders", "id").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        let dropped = c.drop_index("idx_id").unwrap();
+        assert_eq!(dropped.table, "users");
+        assert!(!c.index_exists("idx_id"));
     }
 }

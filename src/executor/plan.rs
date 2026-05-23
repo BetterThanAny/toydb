@@ -10,7 +10,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::catalog::Table;
+use crate::catalog::{Index, Table};
 use crate::engine::{Engine, RowId};
 use crate::error::{Error, Result};
 use crate::executor::aggregate::{
@@ -20,9 +20,9 @@ use crate::executor::aggregate::{
 use crate::executor::expr::{Resolver, eval, eval_with};
 use crate::executor::result::{Column as ResultColumn, ResultSet};
 use crate::sql::ast::{
-    AlterAction, AlterTableStmt, CreateTableStmt, DeleteStmt, DropTableStmt, Expression,
-    FromClause, InsertSource, InsertStmt, JoinKind, OrderBy, SelectItem, SelectStmt, Statement,
-    UpdateStmt,
+    AlterAction, AlterTableStmt, BinaryOp, CreateIndexStmt, CreateTableStmt, DeleteStmt,
+    DropIndexStmt, DropTableStmt, Expression, FromClause, InsertSource, InsertStmt, JoinKind,
+    OrderBy, SelectItem, SelectStmt, Statement, UpdateStmt,
 };
 use crate::types::row::Row;
 use crate::types::value::Value;
@@ -48,6 +48,8 @@ impl<'a> Executor<'a> {
             Statement::CreateTable(s) => self.exec_create_table(s),
             Statement::DropTable(s) => self.exec_drop_table(s),
             Statement::AlterTable(s) => self.exec_alter_table(s),
+            Statement::CreateIndex(s) => self.exec_create_index(s),
+            Statement::DropIndex(s) => self.exec_drop_index(s),
             Statement::Insert(s) => self.exec_insert(s),
             Statement::Select(s) => self.exec_select(s),
             Statement::Update(s) => self.exec_update(s),
@@ -64,7 +66,9 @@ impl<'a> Executor<'a> {
                 self.engine.rollback()?;
                 Ok(ResultSet::Rollback)
             }
-            Statement::Explain(inner) => Ok(ResultSet::Explain(describe_plan(inner))),
+            Statement::Explain(inner) => {
+                Ok(ResultSet::Explain(describe_plan(&*self.engine, inner)?))
+            }
         }
     }
 
@@ -107,6 +111,8 @@ impl<'a> Executor<'a> {
             Statement::CreateTable(_)
             | Statement::DropTable(_)
             | Statement::AlterTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
             | Statement::Begin
             | Statement::Commit
             | Statement::Rollback => Ok(()),
@@ -295,6 +301,23 @@ impl<'a> Executor<'a> {
         })
     }
 
+    fn exec_create_index(&mut self, c: &CreateIndexStmt) -> Result<ResultSet> {
+        let table = self.engine.get_table(&c.table)?;
+        table.column_index(&c.column)?;
+        let index = Index::new(&c.name, &c.table, &c.column)?;
+        self.engine.create_index(index)?;
+        Ok(ResultSet::CreateIndex {
+            name: c.name.clone(),
+        })
+    }
+
+    fn exec_drop_index(&mut self, d: &DropIndexStmt) -> Result<ResultSet> {
+        self.engine.drop_index(&d.name)?;
+        Ok(ResultSet::DropIndex {
+            name: d.name.clone(),
+        })
+    }
+
     // ------------------------------------------------------------------
     // INSERT
     // ------------------------------------------------------------------
@@ -464,7 +487,7 @@ impl<'a> Executor<'a> {
         }
 
         // Materialise the FROM clause into a wide row set.
-        let materialised = self.build_source(s.from.as_ref().unwrap())?;
+        let materialised = self.build_source(s.from.as_ref().unwrap(), s.r#where.as_ref())?;
         let WideSource { schema, mut rows } = materialised;
 
         // -- WHERE -----------------------------------------------------
@@ -847,7 +870,11 @@ impl<'a> Executor<'a> {
     // FROM materialisation (single table + nested-loop joins)
     // ------------------------------------------------------------------
 
-    fn build_source(&mut self, from: &FromClause) -> Result<WideSource> {
+    fn build_source(
+        &mut self,
+        from: &FromClause,
+        pushdown_predicate: Option<&Expression>,
+    ) -> Result<WideSource> {
         match from {
             FromClause::Table { name, alias } => {
                 let table = self.engine.get_table(name)?.clone();
@@ -860,7 +887,13 @@ impl<'a> Executor<'a> {
                         column: col.name.clone(),
                     });
                 }
-                let raw = self.engine.scan(name)?;
+                let raw = match choose_index_lookup(&table, &alias_str, pushdown_predicate) {
+                    Some(lookup) => {
+                        self.engine
+                            .lookup_index(name, &lookup.index.name, &lookup.key)?
+                    }
+                    None => self.engine.scan(name)?,
+                };
                 Ok(WideSource {
                     schema: WideSchema { columns: entries },
                     rows: raw.into_iter().map(|(_, r)| r).collect(),
@@ -872,8 +905,8 @@ impl<'a> Executor<'a> {
                 right,
                 on,
             } => {
-                let left = self.build_source(left)?;
-                let right = self.build_source(right)?;
+                let left = self.build_source(left, None)?;
+                let right = self.build_source(right, None)?;
                 let (schema, rows) = nested_loop_join(left, right, *kind, on)?;
                 Ok(WideSource { schema, rows })
             }
@@ -1102,6 +1135,123 @@ impl<'a> Resolver for SingleTable<'a> {
         let idx = self.table.column_index(name)?;
         Ok(self.row.0[idx].clone())
     }
+}
+
+// ---------------------------------------------------------------------
+// Access planning for single-table equality predicates
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct IndexLookup {
+    index: Index,
+    key: Value,
+}
+
+fn choose_index_lookup(
+    table: &Table,
+    alias: &str,
+    predicate: Option<&Expression>,
+) -> Option<IndexLookup> {
+    let predicate = predicate?;
+    find_index_lookup(table, alias, predicate)
+}
+
+fn find_index_lookup(table: &Table, alias: &str, expr: &Expression) -> Option<IndexLookup> {
+    match expr {
+        Expression::Binary(left, BinaryOp::And, right) => {
+            find_index_lookup(table, alias, left).or_else(|| find_index_lookup(table, alias, right))
+        }
+        Expression::Binary(left, BinaryOp::Eq, right) => {
+            index_lookup_from_eq(table, alias, left, right)
+                .or_else(|| index_lookup_from_eq(table, alias, right, left))
+        }
+        _ => None,
+    }
+}
+
+fn index_lookup_from_eq(
+    table: &Table,
+    alias: &str,
+    column_expr: &Expression,
+    value_expr: &Expression,
+) -> Option<IndexLookup> {
+    let column = matching_column(table, alias, column_expr)?;
+    let column_idx = table.column_index(column).ok()?;
+    let key = constant_value(value_expr)?;
+    if !index_key_compatible(table.columns[column_idx].ty, &key) {
+        return None;
+    }
+    let index = table.index_on_column(column)?.clone();
+    Some(IndexLookup { index, key })
+}
+
+fn matching_column<'a>(table: &Table, alias: &str, expr: &'a Expression) -> Option<&'a str> {
+    match expr {
+        Expression::Column(name) => Some(name.as_str()),
+        Expression::Qualified(qualifier, name)
+            if qualifier == alias || qualifier == &table.name =>
+        {
+            Some(name.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn constant_value(expr: &Expression) -> Option<Value> {
+    if expr_contains_column(expr) {
+        return None;
+    }
+    eval(expr).ok()
+}
+
+fn expr_contains_column(expr: &Expression) -> bool {
+    match expr {
+        Expression::Column(_) | Expression::Qualified(_, _) | Expression::Wildcard => true,
+        Expression::Literal(_) => false,
+        Expression::Unary(_, inner) => expr_contains_column(inner),
+        Expression::Binary(left, _, right) => {
+            expr_contains_column(left) || expr_contains_column(right)
+        }
+        Expression::IsNull { expr, .. } => expr_contains_column(expr),
+        Expression::InList { expr, list, .. } => {
+            expr_contains_column(expr) || list.iter().any(expr_contains_column)
+        }
+        Expression::Between {
+            expr, low, high, ..
+        } => expr_contains_column(expr) || expr_contains_column(low) || expr_contains_column(high),
+        Expression::Like { expr, pattern, .. } => {
+            expr_contains_column(expr) || expr_contains_column(pattern)
+        }
+        Expression::Function { args, .. } => args.iter().any(expr_contains_column),
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_column)
+                || branches
+                    .iter()
+                    .any(|(when, then)| expr_contains_column(when) || expr_contains_column(then))
+                || otherwise.as_deref().is_some_and(expr_contains_column)
+        }
+        // Scalar subqueries are resolved before planning. If one reaches
+        // here, keep the conservative SeqScan path.
+        Expression::Scalar(_) => true,
+    }
+}
+
+fn index_key_compatible(column_ty: crate::sql::ast::DataType, key: &Value) -> bool {
+    use crate::sql::ast::DataType;
+    matches!(
+        (column_ty, key),
+        (_, Value::Null)
+            | (
+                DataType::Integer | DataType::Float,
+                Value::Integer(_) | Value::Float(_)
+            )
+            | (DataType::Boolean, Value::Boolean(_))
+            | (DataType::String, Value::String(_))
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -1661,9 +1811,9 @@ fn rewrite_aliases(expr: &Expression, aliases: &HashMap<&str, &Expression>) -> E
 // EXPLAIN — textual plan
 // ---------------------------------------------------------------------
 
-fn describe_plan(stmt: &Statement) -> String {
-    match stmt {
-        Statement::Select(s) => describe_select(s),
+fn describe_plan(engine: &dyn Engine, stmt: &Statement) -> Result<String> {
+    Ok(match stmt {
+        Statement::Select(s) => describe_select(engine, s)?,
         Statement::Insert(i) => match &i.source {
             InsertSource::Values(rows) => {
                 format!(
@@ -1694,19 +1844,25 @@ fn describe_plan(stmt: &Statement) -> String {
         ),
         Statement::CreateTable(c) => format!("CreateTable `{}`", c.name),
         Statement::DropTable(d) => format!("DropTable `{}`", d.name),
+        Statement::CreateIndex(c) => {
+            format!("CreateIndex `{}` ON `{}`({})", c.name, c.table, c.column)
+        }
+        Statement::DropIndex(d) => format!("DropIndex `{}`", d.name),
         Statement::AlterTable(a) => format!("AlterTable `{}`", a.name),
         Statement::Begin => "Begin".into(),
         Statement::Commit => "Commit".into(),
         Statement::Rollback => "Rollback".into(),
-        Statement::Explain(inner) => format!("Explain (nested):\n{}", describe_plan(inner)),
-    }
+        Statement::Explain(inner) => {
+            format!("Explain (nested):\n{}", describe_plan(engine, inner)?)
+        }
+    })
 }
 
-fn describe_select(s: &SelectStmt) -> String {
+fn describe_select(engine: &dyn Engine, s: &SelectStmt) -> Result<String> {
     let mut lines: Vec<String> = Vec::new();
     match &s.from {
         None => lines.push("Const".into()),
-        Some(from) => lines.extend(describe_from(from, 0)),
+        Some(from) => lines.extend(describe_from(engine, from, 0, s.r#where.as_ref())?),
     }
     if s.r#where.is_some() {
         lines.push("  Filter (WHERE)".into());
@@ -1734,32 +1890,45 @@ fn describe_select(s: &SelectStmt) -> String {
     for u in &s.unions {
         let kind = if u.all { "UNION ALL" } else { "UNION" };
         lines.push(format!("{kind}:"));
-        for sub in describe_select(&u.query).lines() {
+        for sub in describe_select(engine, &u.query)?.lines() {
             lines.push(format!("  {sub}"));
         }
     }
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
-fn describe_from(from: &FromClause, indent: usize) -> Vec<String> {
+fn describe_from(
+    engine: &dyn Engine,
+    from: &FromClause,
+    indent: usize,
+    pushdown_predicate: Option<&Expression>,
+) -> Result<Vec<String>> {
     let pad = "  ".repeat(indent);
-    match from {
+    Ok(match from {
         FromClause::Table { name, alias } => {
+            let table = engine.get_table(name)?;
+            let alias_str = alias.clone().unwrap_or_else(|| name.clone());
             let alias = alias
                 .as_deref()
                 .map(|a| format!(" AS {a}"))
                 .unwrap_or_default();
-            vec![format!("{pad}Scan `{name}`{alias}")]
+            match choose_index_lookup(table, &alias_str, pushdown_predicate) {
+                Some(lookup) => vec![format!(
+                    "{pad}IndexScan `{name}`{alias} (index={}, key={})",
+                    lookup.index.name, lookup.key
+                )],
+                None => vec![format!("{pad}SeqScan `{name}`{alias}")],
+            }
         }
         FromClause::Join {
             left, kind, right, ..
         } => {
             let mut out = vec![format!("{pad}{} Join", join_label(*kind))];
-            out.extend(describe_from(left, indent + 1));
-            out.extend(describe_from(right, indent + 1));
+            out.extend(describe_from(engine, left, indent + 1, None)?);
+            out.extend(describe_from(engine, right, indent + 1, None)?);
             out
         }
-    }
+    })
 }
 
 fn join_label(k: JoinKind) -> &'static str {

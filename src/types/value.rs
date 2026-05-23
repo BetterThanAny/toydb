@@ -49,9 +49,7 @@ impl Value {
             (Value::Null, _) => Value::Null,
             (Value::Boolean(b), DataType::Boolean) => Value::Boolean(*b),
             (Value::Boolean(b), DataType::Integer) => Value::Integer(if *b { 1 } else { 0 }),
-            (Value::Boolean(b), DataType::Float) => {
-                Value::Float(if *b { 1.0 } else { 0.0 })
-            }
+            (Value::Boolean(b), DataType::Float) => Value::Float(if *b { 1.0 } else { 0.0 }),
             (Value::Boolean(b), DataType::String) => Value::String(b.to_string()),
             (Value::Integer(n), DataType::Integer) => Value::Integer(*n),
             (Value::Integer(n), DataType::Float) => Value::Float(*n as f64),
@@ -69,12 +67,14 @@ impl Value {
             (Value::Float(f), DataType::String) => Value::String(format_float(*f)),
             (Value::Float(f), DataType::Boolean) => Value::Boolean(*f != 0.0),
             (Value::String(s), DataType::String) => Value::String(s.clone()),
-            (Value::String(s), DataType::Integer) => Value::Integer(s.parse().map_err(|_| {
-                Error::ty(format!("cannot parse `{s}` as INTEGER"))
-            })?),
-            (Value::String(s), DataType::Float) => Value::Float(s.parse().map_err(|_| {
-                Error::ty(format!("cannot parse `{s}` as FLOAT"))
-            })?),
+            (Value::String(s), DataType::Integer) => Value::Integer(
+                s.parse()
+                    .map_err(|_| Error::ty(format!("cannot parse `{s}` as INTEGER")))?,
+            ),
+            (Value::String(s), DataType::Float) => Value::Float(
+                s.parse()
+                    .map_err(|_| Error::ty(format!("cannot parse `{s}` as FLOAT")))?,
+            ),
             (Value::String(s), DataType::Boolean) => match s.to_ascii_lowercase().as_str() {
                 "true" | "t" | "1" => Value::Boolean(true),
                 "false" | "f" | "0" => Value::Boolean(false),
@@ -174,7 +174,11 @@ fn format_float(f: f64) -> String {
     if f.is_nan() {
         "NaN".into()
     } else if f.is_infinite() {
-        if f.is_sign_positive() { "Inf".into() } else { "-Inf".into() }
+        if f.is_sign_positive() {
+            "Inf".into()
+        } else {
+            "-Inf".into()
+        }
     } else if f == f.trunc() && f.abs() < 1e16 {
         // Integers we display as `1.0` rather than `1` so the type
         // still reads as float in REPL output.
@@ -186,22 +190,34 @@ fn format_float(f: f64) -> String {
 
 // Convenience constructors used pervasively in tests and the executor.
 impl From<i64> for Value {
-    fn from(v: i64) -> Self { Value::Integer(v) }
+    fn from(v: i64) -> Self {
+        Value::Integer(v)
+    }
 }
 impl From<i32> for Value {
-    fn from(v: i32) -> Self { Value::Integer(v as i64) }
+    fn from(v: i32) -> Self {
+        Value::Integer(v as i64)
+    }
 }
 impl From<f64> for Value {
-    fn from(v: f64) -> Self { Value::Float(v) }
+    fn from(v: f64) -> Self {
+        Value::Float(v)
+    }
 }
 impl From<bool> for Value {
-    fn from(v: bool) -> Self { Value::Boolean(v) }
+    fn from(v: bool) -> Self {
+        Value::Boolean(v)
+    }
 }
 impl From<&str> for Value {
-    fn from(v: &str) -> Self { Value::String(v.into()) }
+    fn from(v: &str) -> Self {
+        Value::String(v.into())
+    }
 }
 impl From<String> for Value {
-    fn from(v: String) -> Self { Value::String(v) }
+    fn from(v: String) -> Self {
+        Value::String(v)
+    }
 }
 impl<T: Into<Value>> From<Option<T>> for Value {
     fn from(v: Option<T>) -> Self {
@@ -228,32 +244,68 @@ mod tests {
 
     #[test]
     fn coerce_int_to_float() {
-        assert_eq!(Value::Integer(3).coerce(DataType::Float).unwrap(), Value::Float(3.0));
+        assert_eq!(
+            Value::Integer(3).coerce(DataType::Float).unwrap(),
+            Value::Float(3.0)
+        );
     }
 
     #[test]
     fn coerce_float_to_int_truncates() {
-        assert_eq!(Value::Float(3.9).coerce(DataType::Integer).unwrap(), Value::Integer(3));
-        assert_eq!(Value::Float(-3.9).coerce(DataType::Integer).unwrap(), Value::Integer(-3));
+        assert_eq!(
+            Value::Float(3.9).coerce(DataType::Integer).unwrap(),
+            Value::Integer(3)
+        );
+        assert_eq!(
+            Value::Float(-3.9).coerce(DataType::Integer).unwrap(),
+            Value::Integer(-3)
+        );
     }
 
     #[test]
     fn coerce_string_to_int() {
-        assert_eq!(Value::String("42".into()).coerce(DataType::Integer).unwrap(), Value::Integer(42));
-        assert!(Value::String("abc".into()).coerce(DataType::Integer).is_err());
+        assert_eq!(
+            Value::String("42".into())
+                .coerce(DataType::Integer)
+                .unwrap(),
+            Value::Integer(42)
+        );
+        assert!(
+            Value::String("abc".into())
+                .coerce(DataType::Integer)
+                .is_err()
+        );
     }
 
     #[test]
     fn coerce_string_to_bool() {
-        assert_eq!(Value::String("true".into()).coerce(DataType::Boolean).unwrap(), Value::Boolean(true));
-        assert_eq!(Value::String("FALSE".into()).coerce(DataType::Boolean).unwrap(), Value::Boolean(false));
-        assert!(Value::String("maybe".into()).coerce(DataType::Boolean).is_err());
+        assert_eq!(
+            Value::String("true".into())
+                .coerce(DataType::Boolean)
+                .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            Value::String("FALSE".into())
+                .coerce(DataType::Boolean)
+                .unwrap(),
+            Value::Boolean(false)
+        );
+        assert!(
+            Value::String("maybe".into())
+                .coerce(DataType::Boolean)
+                .is_err()
+        );
     }
 
     #[test]
     fn coerce_nan_to_int_errors() {
         assert!(Value::Float(f64::NAN).coerce(DataType::Integer).is_err());
-        assert!(Value::Float(f64::INFINITY).coerce(DataType::Integer).is_err());
+        assert!(
+            Value::Float(f64::INFINITY)
+                .coerce(DataType::Integer)
+                .is_err()
+        );
     }
 
     #[test]
@@ -266,19 +318,39 @@ mod tests {
 
     #[test]
     fn cmp_with_null_returns_none() {
-        assert!(Value::Null.partial_cmp_sql(&Value::Integer(0)).unwrap().is_none());
-        assert!(Value::Integer(0).partial_cmp_sql(&Value::Null).unwrap().is_none());
+        assert!(
+            Value::Null
+                .partial_cmp_sql(&Value::Integer(0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Value::Integer(0)
+                .partial_cmp_sql(&Value::Null)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn cmp_incompatible_errors() {
-        assert!(Value::String("x".into()).partial_cmp_sql(&Value::Integer(1)).is_err());
+        assert!(
+            Value::String("x".into())
+                .partial_cmp_sql(&Value::Integer(1))
+                .is_err()
+        );
     }
 
     #[test]
     fn equal_sql_three_valued() {
-        assert_eq!(Value::Integer(1).equal_sql(&Value::Integer(1)).unwrap(), Some(true));
-        assert_eq!(Value::Integer(1).equal_sql(&Value::Integer(2)).unwrap(), Some(false));
+        assert_eq!(
+            Value::Integer(1).equal_sql(&Value::Integer(1)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            Value::Integer(1).equal_sql(&Value::Integer(2)).unwrap(),
+            Some(false)
+        );
         assert_eq!(Value::Null.equal_sql(&Value::Integer(1)).unwrap(), None);
         assert_eq!(Value::Null.equal_sql(&Value::Null).unwrap(), None);
     }
@@ -293,7 +365,10 @@ mod tests {
     #[test]
     fn total_cmp_cross_type_uses_tag() {
         // String "1" is greater than Integer 1 because String tag (4) > Integer tag (2).
-        assert_eq!(Value::String("1".into()).total_cmp(&Value::Integer(1)), Ordering::Greater);
+        assert_eq!(
+            Value::String("1".into()).total_cmp(&Value::Integer(1)),
+            Ordering::Greater
+        );
     }
 
     #[test]

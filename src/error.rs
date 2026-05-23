@@ -12,11 +12,19 @@ use thiserror::Error;
 pub enum Error {
     /// Lexer rejected input.
     #[error("lex error at line {line}, col {col}: {msg}")]
-    Lex { line: usize, col: usize, msg: String },
+    Lex {
+        line: usize,
+        col: usize,
+        msg: String,
+    },
 
     /// Parser rejected token stream.
     #[error("parse error at line {line}, col {col}: {msg}")]
-    Parse { line: usize, col: usize, msg: String },
+    Parse {
+        line: usize,
+        col: usize,
+        msg: String,
+    },
 
     /// Schema / catalog inconsistency: missing table, duplicate column, ...
     #[error("schema error: {0}")]
@@ -53,11 +61,19 @@ pub enum Error {
 
 impl Error {
     pub fn lex(line: usize, col: usize, msg: impl Into<String>) -> Self {
-        Self::Lex { line, col, msg: msg.into() }
+        Self::Lex {
+            line,
+            col,
+            msg: msg.into(),
+        }
     }
 
     pub fn parse(line: usize, col: usize, msg: impl Into<String>) -> Self {
-        Self::Parse { line, col, msg: msg.into() }
+        Self::Parse {
+            line,
+            col,
+            msg: msg.into(),
+        }
     }
 
     pub fn schema(msg: impl Into<String>) -> Self {

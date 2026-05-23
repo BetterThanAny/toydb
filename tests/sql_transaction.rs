@@ -10,12 +10,16 @@ use toydb::types::value::Value;
 
 fn run(engine: &mut MemoryEngine, sql: &str) -> ResultSet {
     let stmt = Parser::parse_one(sql).unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
-    Executor::new(engine).execute(&stmt).unwrap_or_else(|e| panic!("exec `{sql}`: {e}"))
+    Executor::new(engine)
+        .execute(&stmt)
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"))
 }
 
 fn try_run(engine: &mut MemoryEngine, sql: &str) -> Result<ResultSet, String> {
     let stmt = Parser::parse_one(sql).map_err(|e| e.to_string())?;
-    Executor::new(engine).execute(&stmt).map_err(|e| e.to_string())
+    Executor::new(engine)
+        .execute(&stmt)
+        .map_err(|e| e.to_string())
 }
 
 fn run_all(engine: &mut MemoryEngine, sql: &str) {
@@ -27,10 +31,13 @@ fn run_all(engine: &mut MemoryEngine, sql: &str) {
 #[test]
 fn rollback_undoes_inserts() {
     let mut e = MemoryEngine::new();
-    run_all(&mut e, "
+    run_all(
+        &mut e,
+        "
         CREATE TABLE t (id INT PRIMARY KEY, v INT);
         INSERT INTO t VALUES (1, 10), (2, 20);
-    ");
+    ",
+    );
     run(&mut e, "BEGIN");
     assert!(e.in_transaction());
     run(&mut e, "INSERT INTO t VALUES (3, 30)");
@@ -63,10 +70,13 @@ fn commit_keeps_inserts() {
 #[test]
 fn rollback_undoes_updates_and_deletes() {
     let mut e = MemoryEngine::new();
-    run_all(&mut e, "
+    run_all(
+        &mut e,
+        "
         CREATE TABLE t (id INT PRIMARY KEY, n INT);
         INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
-    ");
+    ",
+    );
     run(&mut e, "BEGIN");
     run(&mut e, "UPDATE t SET n = n + 100");
     run(&mut e, "DELETE FROM t WHERE id = 1");

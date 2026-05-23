@@ -18,6 +18,8 @@ pub enum Statement {
     Delete(Box<DeleteStmt>),
     CreateTable(Box<CreateTableStmt>),
     DropTable(Box<DropTableStmt>),
+    CreateIndex(Box<CreateIndexStmt>),
+    DropIndex(Box<DropIndexStmt>),
     AlterTable(Box<AlterTableStmt>),
     Begin,
     Commit,
@@ -66,7 +68,10 @@ pub enum SelectItem {
     /// `t.*` — every column from a single table or alias.
     QualifiedWildcard(String),
     /// Expression with an optional `AS alias`.
-    Expr { expr: Expression, alias: Option<String> },
+    Expr {
+        expr: Expression,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +174,18 @@ pub struct DropTableStmt {
     pub if_exists: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStmt {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStmt {
+    pub name: String,
+}
+
 // ---------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------
@@ -183,17 +200,37 @@ pub enum Expression {
     Unary(UnaryOp, Box<Expression>),
     Binary(Box<Expression>, BinaryOp, Box<Expression>),
     /// `expr IS [NOT] NULL`. `negated` flips the sense.
-    IsNull { expr: Box<Expression>, negated: bool },
+    IsNull {
+        expr: Box<Expression>,
+        negated: bool,
+    },
     /// `expr [NOT] IN (a, b, c)`.
-    InList { expr: Box<Expression>, list: Vec<Expression>, negated: bool },
+    InList {
+        expr: Box<Expression>,
+        list: Vec<Expression>,
+        negated: bool,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
-    Between { expr: Box<Expression>, low: Box<Expression>, high: Box<Expression>, negated: bool },
+    Between {
+        expr: Box<Expression>,
+        low: Box<Expression>,
+        high: Box<Expression>,
+        negated: bool,
+    },
     /// `expr [NOT] LIKE pattern`.
-    Like { expr: Box<Expression>, pattern: Box<Expression>, negated: bool },
+    Like {
+        expr: Box<Expression>,
+        pattern: Box<Expression>,
+        negated: bool,
+    },
     /// `f(arg, arg, ...)` — function call. We also model `COUNT(*)` here
     /// using a single `Wildcard` arg. `distinct` is set for
     /// `COUNT(DISTINCT col)` and friends; ordinary calls leave it false.
-    Function { name: String, args: Vec<Expression>, distinct: bool },
+    Function {
+        name: String,
+        args: Vec<Expression>,
+        distinct: bool,
+    },
     /// `*` inside a function call (specifically `COUNT(*)`).
     Wildcard,
     /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`. With operand:

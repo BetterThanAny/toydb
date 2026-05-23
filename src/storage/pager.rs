@@ -12,7 +12,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::storage::page::{Page, PageId, PageType, HEADER_SIZE, PAGE_SIZE};
+use crate::storage::page::{HEADER_SIZE, PAGE_SIZE, Page, PageId, PageType};
 
 pub const MAGIC: &[u8; 8] = b"TOYDB001";
 pub const SUPER_PAGE: PageId = 0;
@@ -66,14 +66,20 @@ impl Pager {
         Ok(p)
     }
 
-    pub fn page_count(&self) -> u64 { self.page_count }
-    pub fn catalog_root(&self) -> PageId { self.catalog_root }
+    pub fn page_count(&self) -> u64 {
+        self.page_count
+    }
+    pub fn catalog_root(&self) -> PageId {
+        self.catalog_root
+    }
     pub fn set_catalog_root(&mut self, id: PageId) -> Result<()> {
         self.catalog_root = id;
         self.write_super()
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     /// Return a borrowed copy of a page. The pager keeps an authoritative
     /// in-memory copy; callers mutate via [`Pager::write_page`].
@@ -88,7 +94,13 @@ impl Pager {
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.read_exact(&mut buf)?;
         let page = Page::from_bytes(buf);
-        self.cache.insert(id, CacheEntry { page: page.clone(), dirty: false });
+        self.cache.insert(
+            id,
+            CacheEntry {
+                page: page.clone(),
+                dirty: false,
+            },
+        );
         Ok(page)
     }
 
@@ -133,7 +145,13 @@ impl Pager {
         }
         let mut p = Page::new(PageType::Free);
         p.set_next_page(self.free_head);
-        self.cache.insert(id, CacheEntry { page: p, dirty: true });
+        self.cache.insert(
+            id,
+            CacheEntry {
+                page: p,
+                dirty: true,
+            },
+        );
         self.free_head = id;
         self.write_super()?;
         Ok(())
@@ -176,7 +194,13 @@ impl Pager {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(super_page.raw())?;
         self.file.sync_data()?;
-        self.cache.insert(SUPER_PAGE, CacheEntry { page: super_page, dirty: false });
+        self.cache.insert(
+            SUPER_PAGE,
+            CacheEntry {
+                page: super_page,
+                dirty: false,
+            },
+        );
         self.page_count = 1;
         self.free_head = 0;
         self.catalog_root = 0;
@@ -198,7 +222,8 @@ impl Pager {
         self.free_head = read_u64(&buf, SUPER_FREE_HEAD_OFF);
         self.catalog_root = read_u64(&buf, SUPER_CATALOG_ROOT_OFF);
         let page = Page::from_bytes(buf);
-        self.cache.insert(SUPER_PAGE, CacheEntry { page, dirty: false });
+        self.cache
+            .insert(SUPER_PAGE, CacheEntry { page, dirty: false });
         Ok(())
     }
 
@@ -208,8 +233,13 @@ impl Pager {
         write_u32(page.raw_slice_mut(), SUPER_VERSION_OFF, 1);
         write_u64(page.raw_slice_mut(), SUPER_PAGE_COUNT_OFF, self.page_count);
         write_u64(page.raw_slice_mut(), SUPER_FREE_HEAD_OFF, self.free_head);
-        write_u64(page.raw_slice_mut(), SUPER_CATALOG_ROOT_OFF, self.catalog_root);
-        self.cache.insert(SUPER_PAGE, CacheEntry { page, dirty: true });
+        write_u64(
+            page.raw_slice_mut(),
+            SUPER_CATALOG_ROOT_OFF,
+            self.catalog_root,
+        );
+        self.cache
+            .insert(SUPER_PAGE, CacheEntry { page, dirty: true });
         Ok(())
     }
 }

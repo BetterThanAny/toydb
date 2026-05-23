@@ -90,6 +90,44 @@ impl From<&ColumnDef> for Column {
     }
 }
 
+/// Single-column secondary index metadata.
+///
+/// The index contents live in the storage engine. The catalog persists
+/// the name/table/column descriptor so disk-backed engines can rebuild
+/// the runtime tree after opening a database or replaying the WAL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Index {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+}
+
+impl Index {
+    pub fn new(
+        name: impl Into<String>,
+        table: impl Into<String>,
+        column: impl Into<String>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let table = table.into();
+        let column = column.into();
+        if name.is_empty() {
+            return Err(Error::schema("index name must not be empty"));
+        }
+        if table.is_empty() {
+            return Err(Error::schema("index table must not be empty"));
+        }
+        if column.is_empty() {
+            return Err(Error::schema("index column must not be empty"));
+        }
+        Ok(Self {
+            name,
+            table,
+            column,
+        })
+    }
+}
+
 /// A table schema: name, columns, and the index of the primary-key
 /// column (if any). At most one PK per table.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +135,7 @@ pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
     pub primary_key: Option<usize>,
+    pub indexes: Vec<Index>,
 }
 
 impl Table {
@@ -143,6 +182,7 @@ impl Table {
             name,
             columns,
             primary_key,
+            indexes: Vec::new(),
         })
     }
 
@@ -157,6 +197,33 @@ impl Table {
     /// Borrow the primary-key column descriptor, if any.
     pub fn primary_key_column(&self) -> Option<&Column> {
         self.primary_key.map(|i| &self.columns[i])
+    }
+
+    pub fn add_index(&mut self, index: Index) -> Result<()> {
+        if index.table != self.name {
+            return Err(Error::schema(format!(
+                "index `{}` targets table `{}`, not `{}`",
+                index.name, index.table, self.name
+            )));
+        }
+        self.column_index(&index.column)?;
+        if self.indexes.iter().any(|i| i.name == index.name) {
+            return Err(Error::schema(format!(
+                "index `{}` already exists on table `{}`",
+                index.name, self.name
+            )));
+        }
+        self.indexes.push(index);
+        Ok(())
+    }
+
+    pub fn drop_index(&mut self, name: &str) -> Option<Index> {
+        let pos = self.indexes.iter().position(|i| i.name == name)?;
+        Some(self.indexes.remove(pos))
+    }
+
+    pub fn index_on_column(&self, column: &str) -> Option<&Index> {
+        self.indexes.iter().find(|i| i.column == column)
     }
 }
 
@@ -241,5 +308,26 @@ mod tests {
         let c = Column::from(&def);
         assert!(c.unique);
         assert!(c.primary_key);
+    }
+
+    #[test]
+    fn add_and_drop_index_metadata() {
+        let mut t = Table::new(
+            "users",
+            vec![
+                col("id", DataType::Integer).primary_key(),
+                col("age", DataType::Integer),
+            ],
+        )
+        .unwrap();
+        t.add_index(Index::new("idx_users_age", "users", "age").unwrap())
+            .unwrap();
+        assert_eq!(t.index_on_column("age").unwrap().name, "idx_users_age");
+        assert!(
+            t.add_index(Index::new("idx_bad", "users", "missing").unwrap())
+                .is_err()
+        );
+        assert_eq!(t.drop_index("idx_users_age").unwrap().column, "age");
+        assert!(t.indexes.is_empty());
     }
 }

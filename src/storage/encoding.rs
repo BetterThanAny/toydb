@@ -23,11 +23,15 @@
 //!     u8  flags (bit 0 = primary_key, bit 1 = nullable, bit 2 = unique)
 //!     u8  has_default (0/1)
 //!     [if has_default] Value (encoded literal)
+//!   u32 index_count
+//!   per index:
+//!     u32 name_len + name_bytes
+//!     u32 column_len + column_bytes
 //! ```
 
 use std::io::{Read, Write};
 
-use crate::catalog::{Column, Table};
+use crate::catalog::{Column, Index, Table};
 use crate::error::{Error, Result};
 use crate::sql::ast::{DataType, Expression, Literal};
 use crate::types::row::Row;
@@ -72,8 +76,7 @@ pub fn decode_value(r: &mut &[u8]) -> Result<Value> {
             let len = read_u32(r)? as usize;
             let bytes = read_bytes(r, len)?;
             Value::String(
-                String::from_utf8(bytes)
-                    .map_err(|e| Error::other(format!("decode utf-8: {e}")))?,
+                String::from_utf8(bytes).map_err(|e| Error::other(format!("decode utf-8: {e}")))?,
             )
         }
         other => return Err(Error::other(format!("unknown Value tag {other}"))),
@@ -110,6 +113,11 @@ pub fn encode_table(t: &Table, w: &mut Vec<u8>) {
     for c in &t.columns {
         encode_column(c, w);
     }
+    w.extend_from_slice(&(t.indexes.len() as u32).to_le_bytes());
+    for index in &t.indexes {
+        encode_string(&index.name, w);
+        encode_string(&index.column, w);
+    }
 }
 
 pub fn decode_table(r: &mut &[u8]) -> Result<Table> {
@@ -119,16 +127,34 @@ pub fn decode_table(r: &mut &[u8]) -> Result<Table> {
     for _ in 0..n {
         cols.push(decode_column(r)?);
     }
-    Table::new(name, cols)
+    let mut table = Table::new(name, cols)?;
+    // Older catalog entries ended after the column list. Treat that as
+    // an empty index list so databases from before indexes still open.
+    if r.is_empty() {
+        return Ok(table);
+    }
+    let index_count = read_u32(r)? as usize;
+    for _ in 0..index_count {
+        let index_name = decode_string(r)?;
+        let column = decode_string(r)?;
+        table.add_index(Index::new(index_name, table.name.clone(), column)?)?;
+    }
+    Ok(table)
 }
 
 fn encode_column(c: &Column, w: &mut Vec<u8>) {
     encode_string(&c.name, w);
     w.push(datatype_tag(c.ty));
     let mut flags = 0u8;
-    if c.primary_key { flags |= 0b001; }
-    if c.nullable { flags |= 0b010; }
-    if c.unique { flags |= 0b100; }
+    if c.primary_key {
+        flags |= 0b001;
+    }
+    if c.nullable {
+        flags |= 0b010;
+    }
+    if c.unique {
+        flags |= 0b100;
+    }
     w.push(flags);
     match &c.default {
         None => w.push(0),
@@ -309,14 +335,24 @@ mod tests {
     fn roundtrip_all_value_kinds() {
         assert_eq!(roundtrip_value(Value::Null), Value::Null);
         assert_eq!(roundtrip_value(Value::Boolean(true)), Value::Boolean(true));
-        assert_eq!(roundtrip_value(Value::Integer(-1234)), Value::Integer(-1234));
+        assert_eq!(
+            roundtrip_value(Value::Integer(-1234)),
+            Value::Integer(-1234)
+        );
         assert_eq!(roundtrip_value(Value::Float(2.5)), Value::Float(2.5));
-        assert_eq!(roundtrip_value(Value::String("héllo".into())), Value::String("héllo".into()));
+        assert_eq!(
+            roundtrip_value(Value::String("héllo".into())),
+            Value::String("héllo".into())
+        );
     }
 
     #[test]
     fn roundtrip_row() {
-        let r = Row(vec![Value::Integer(1), Value::String("a".into()), Value::Null]);
+        let r = Row(vec![
+            Value::Integer(1),
+            Value::String("a".into()),
+            Value::Null,
+        ]);
         let mut buf = Vec::new();
         encode_row(&r, &mut buf);
         let mut slice = buf.as_slice();
@@ -326,13 +362,18 @@ mod tests {
 
     #[test]
     fn roundtrip_table_basic() {
-        let t = Table::new("users", vec![
-            Column::new("id", DataType::Integer).primary_key(),
-            Column::new("name", DataType::String).not_null(),
-            Column::new("active", DataType::Boolean)
-                .default_value(Expression::Literal(Literal::Boolean(true))),
-        ])
+        let mut t = Table::new(
+            "users",
+            vec![
+                Column::new("id", DataType::Integer).primary_key(),
+                Column::new("name", DataType::String).not_null(),
+                Column::new("active", DataType::Boolean)
+                    .default_value(Expression::Literal(Literal::Boolean(true))),
+            ],
+        )
         .unwrap();
+        t.add_index(Index::new("idx_users_name", "users", "name").unwrap())
+            .unwrap();
         let mut buf = Vec::new();
         encode_table(&t, &mut buf);
         let mut slice = buf.as_slice();
@@ -344,11 +385,16 @@ mod tests {
             t2.columns[2].default,
             Some(Expression::Literal(Literal::Boolean(true)))
         );
+        assert_eq!(t2.indexes[0].name, "idx_users_name");
+        assert_eq!(t2.indexes[0].column, "name");
     }
 
     #[test]
     fn empty_string_decodes() {
-        assert_eq!(roundtrip_value(Value::String("".into())), Value::String("".into()));
+        assert_eq!(
+            roundtrip_value(Value::String("".into())),
+            Value::String("".into())
+        );
     }
 
     #[test]

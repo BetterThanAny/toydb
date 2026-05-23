@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
-use crate::executor::expr::{eval_with, Resolver};
+use crate::executor::expr::{Resolver, eval_with};
 use crate::sql::ast::{Expression, Literal};
 use crate::types::value::Value;
 
@@ -85,7 +85,11 @@ fn collect_inner(
     inside_agg: bool,
 ) -> Result<()> {
     match expr {
-        Expression::Function { name, args, distinct } if aggregate_kind(name).is_some() => {
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } if aggregate_kind(name).is_some() => {
             if inside_agg {
                 return Err(Error::other("aggregates cannot be nested"));
             }
@@ -102,7 +106,14 @@ fn collect_inner(
             let arg = args[0].clone();
             let key = AggKey(expr.clone());
             if !out.iter().any(|(k, _)| k.matches(expr)) {
-                out.push((key, AggSpec { kind, arg, distinct: *distinct }));
+                out.push((
+                    key,
+                    AggSpec {
+                        kind,
+                        arg,
+                        distinct: *distinct,
+                    },
+                ));
             }
         }
         Expression::Function { args, distinct, .. } => {
@@ -127,7 +138,9 @@ fn collect_inner(
                 collect_inner(item, out, inside_agg)?;
             }
         }
-        Expression::Between { expr, low, high, .. } => {
+        Expression::Between {
+            expr, low, high, ..
+        } => {
             collect_inner(expr, out, inside_agg)?;
             collect_inner(low, out, inside_agg)?;
             collect_inner(high, out, inside_agg)?;
@@ -136,7 +149,11 @@ fn collect_inner(
             collect_inner(expr, out, inside_agg)?;
             collect_inner(pattern, out, inside_agg)?;
         }
-        Expression::Case { operand, branches, otherwise } => {
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
             if let Some(op) = operand {
                 collect_inner(op, out, inside_agg)?;
             }
@@ -321,7 +338,9 @@ impl Ord for GroupKey {
 }
 
 impl PartialOrd for GroupKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Map of group key → per-aggregate accumulators.
@@ -344,9 +363,7 @@ pub fn fold_row<R: Resolver + ?Sized>(
         let v = match (&spec.arg, spec.kind) {
             (Expression::Wildcard, AggKind::Count) => Value::Integer(1),
             (Expression::Wildcard, _) => {
-                return Err(Error::ty(format!(
-                    "{} cannot take *", spec.kind.name()
-                )));
+                return Err(Error::ty(format!("{} cannot take *", spec.kind.name())));
             }
             (e, _) => eval_with(e, resolver)?,
         };
@@ -392,9 +409,17 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
         }
         Expression::IsNull { expr, negated } => {
             let v = eval_in_group(expr, aggs, finals, outer)?;
-            Ok(Value::Boolean(if *negated { !v.is_null() } else { v.is_null() }))
+            Ok(Value::Boolean(if *negated {
+                !v.is_null()
+            } else {
+                v.is_null()
+            }))
         }
-        Expression::InList { expr, list, negated } => {
+        Expression::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let needle = eval_in_group(expr, aggs, finals, outer)?;
             let mut found = false;
             let mut saw_null = false;
@@ -424,7 +449,12 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
                 Some(b) => Value::Boolean(if *negated { !b } else { b }),
             })
         }
-        Expression::Between { expr, low, high, negated } => {
+        Expression::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let v = eval_in_group(expr, aggs, finals, outer)?;
             let lo = eval_in_group(low, aggs, finals, outer)?;
             let hi = eval_in_group(high, aggs, finals, outer)?;
@@ -433,11 +463,15 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
             }
             let cmp_lo = v.partial_cmp_sql(&lo)?;
             let cmp_hi = v.partial_cmp_sql(&hi)?;
-            let in_range = matches!(cmp_lo, Some(o) if o.is_ge())
-                && matches!(cmp_hi, Some(o) if o.is_le());
+            let in_range =
+                matches!(cmp_lo, Some(o) if o.is_ge()) && matches!(cmp_hi, Some(o) if o.is_le());
             Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
         }
-        Expression::Like { expr, pattern, negated } => {
+        Expression::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
             let v = eval_in_group(expr, aggs, finals, outer)?;
             let p = eval_in_group(pattern, aggs, finals, outer)?;
             if v.is_null() || p.is_null() {
@@ -445,29 +479,51 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
             }
             let s = match v {
                 Value::String(s) => s,
-                other => return Err(Error::ty(format!("LIKE expects string, got {}", other.type_name()))),
+                other => {
+                    return Err(Error::ty(format!(
+                        "LIKE expects string, got {}",
+                        other.type_name()
+                    )));
+                }
             };
             let pat = match p {
                 Value::String(s) => s,
-                other => return Err(Error::ty(format!("LIKE pattern must be string, got {}", other.type_name()))),
+                other => {
+                    return Err(Error::ty(format!(
+                        "LIKE pattern must be string, got {}",
+                        other.type_name()
+                    )));
+                }
             };
             let m = crate::executor::expr::like_match_for_test(&s, &pat);
             Ok(Value::Boolean(if *negated { !m } else { m }))
         }
-        Expression::Function { name, args, distinct } => {
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } => {
             let new_args: Vec<Expression> = args
                 .iter()
                 .map(|a| eval_in_group(a, aggs, finals, outer).map(literal_to_expr))
                 .collect::<Result<_>>()?;
             eval_with(
-                &Expression::Function { name: name.clone(), args: new_args, distinct: *distinct },
+                &Expression::Function {
+                    name: name.clone(),
+                    args: new_args,
+                    distinct: *distinct,
+                },
                 outer,
             )
         }
         Expression::Scalar(_) => Err(Error::internal(
             "scalar subqueries must be resolved before eval_in_group (executor bug)",
         )),
-        Expression::Case { operand, branches, otherwise } => {
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
             match operand {
                 Some(op) => {
                     let target = eval_in_group(op, aggs, finals, outer)?;
@@ -485,10 +541,12 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
                                 return eval_in_group(then, aggs, finals, outer);
                             }
                             Value::Boolean(false) | Value::Null => continue,
-                            other => return Err(Error::ty(format!(
-                                "CASE WHEN expects boolean, got {}",
-                                other.type_name()
-                            ))),
+                            other => {
+                                return Err(Error::ty(format!(
+                                    "CASE WHEN expects boolean, got {}",
+                                    other.type_name()
+                                )));
+                            }
                         }
                     }
                 }

@@ -33,10 +33,14 @@ pub trait Resolver {
 pub struct EmptyResolver;
 impl Resolver for EmptyResolver {
     fn column(&self, name: &str) -> Result<Value> {
-        Err(Error::ty(format!("column `{name}` referenced outside any row")))
+        Err(Error::ty(format!(
+            "column `{name}` referenced outside any row"
+        )))
     }
     fn qualified(&self, t: &str, c: &str) -> Result<Value> {
-        Err(Error::ty(format!("column `{t}.{c}` referenced outside any row")))
+        Err(Error::ty(format!(
+            "column `{t}.{c}` referenced outside any row"
+        )))
     }
 }
 
@@ -45,7 +49,9 @@ impl Resolver for EmptyResolver {
 // ---------------------------------------------------------------------
 
 /// Evaluate an expression that contains no column references.
-pub fn eval(expr: &Expression) -> Result<Value> { eval_with(expr, &EmptyResolver) }
+pub fn eval(expr: &Expression) -> Result<Value> {
+    eval_with(expr, &EmptyResolver)
+}
 
 /// Evaluate an expression in the context of a [`Resolver`].
 pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value> {
@@ -88,7 +94,11 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
             let is_null = v.is_null();
             Ok(Value::Boolean(if *negated { !is_null } else { is_null }))
         }
-        Expression::InList { expr, list, negated } => {
+        Expression::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let needle = eval_with(expr, r)?;
             if needle.is_null() {
                 return Ok(Value::Null);
@@ -121,7 +131,12 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
                 Some(b) => Value::Boolean(if *negated { !b } else { b }),
             })
         }
-        Expression::Between { expr, low, high, negated } => {
+        Expression::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let v = eval_with(expr, r)?;
             let lo = eval_with(low, r)?;
             let hi = eval_with(high, r)?;
@@ -130,11 +145,15 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
             }
             let cmp_lo = v.partial_cmp_sql(&lo)?;
             let cmp_hi = v.partial_cmp_sql(&hi)?;
-            let in_range = matches!(cmp_lo, Some(o) if o.is_ge())
-                && matches!(cmp_hi, Some(o) if o.is_le());
+            let in_range =
+                matches!(cmp_lo, Some(o) if o.is_ge()) && matches!(cmp_hi, Some(o) if o.is_le());
             Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
         }
-        Expression::Like { expr, pattern, negated } => {
+        Expression::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
             let v = eval_with(expr, r)?;
             let p = eval_with(pattern, r)?;
             if v.is_null() || p.is_null() {
@@ -142,16 +161,30 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
             }
             let s = match v {
                 Value::String(s) => s,
-                other => return Err(Error::ty(format!("LIKE expects string, got {}", other.type_name()))),
+                other => {
+                    return Err(Error::ty(format!(
+                        "LIKE expects string, got {}",
+                        other.type_name()
+                    )));
+                }
             };
             let pat = match p {
                 Value::String(s) => s,
-                other => return Err(Error::ty(format!("LIKE pattern must be string, got {}", other.type_name()))),
+                other => {
+                    return Err(Error::ty(format!(
+                        "LIKE pattern must be string, got {}",
+                        other.type_name()
+                    )));
+                }
             };
             let m = like_match(&s, &pat);
             Ok(Value::Boolean(if *negated { !m } else { m }))
         }
-        Expression::Function { name, args, distinct } => {
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } => {
             if *distinct {
                 return Err(Error::ty(format!(
                     "DISTINCT is only supported inside aggregate calls, not `{name}`"
@@ -162,7 +195,11 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
         Expression::Scalar(_) => Err(Error::internal(
             "scalar subqueries must be resolved before eval (executor bug)",
         )),
-        Expression::Case { operand, branches, otherwise } => {
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
             // Switch form evaluates `operand` once and compares it against
             // each WHEN expression with SQL equality (NULL never matches).
             // Boolean form treats each WHEN as a predicate.
@@ -181,10 +218,12 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
                         match eval_with(when, r)? {
                             Value::Boolean(true) => return eval_with(then, r),
                             Value::Boolean(false) | Value::Null => continue,
-                            other => return Err(Error::ty(format!(
-                                "CASE WHEN expects boolean, got {}",
-                                other.type_name()
-                            ))),
+                            other => {
+                                return Err(Error::ty(format!(
+                                    "CASE WHEN expects boolean, got {}",
+                                    other.type_name()
+                                )));
+                            }
                         }
                     }
                 }
@@ -220,12 +259,25 @@ fn apply_unary(op: UnaryOp, v: Value) -> Result<Value> {
         (UnaryOp::Minus, Value::Integer(n)) => Value::Integer(n.wrapping_neg()),
         (UnaryOp::Minus, Value::Float(f)) => Value::Float(-f),
         (UnaryOp::Not, Value::Boolean(b)) => Value::Boolean(!b),
-        (op, v) => return Err(Error::ty(format!("cannot apply `{op:?}` to {}", v.type_name()))),
+        (op, v) => {
+            return Err(Error::ty(format!(
+                "cannot apply `{op:?}` to {}",
+                v.type_name()
+            )));
+        }
     })
 }
 
 fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
-    if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) {
+    if matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    ) {
         return apply_comparison(op, l, r);
     }
     if l.is_null() || r.is_null() {
@@ -260,7 +312,9 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
         (BinaryOp::Mul, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) * to_f64(r)),
         (BinaryOp::Div, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) / to_f64(r)),
         (BinaryOp::Mod, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) % to_f64(r)),
-        (BinaryOp::Pow, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l).powf(to_f64(r))),
+        (BinaryOp::Pow, l, r) if numeric(&l) && numeric(&r) => {
+            Value::Float(to_f64(l).powf(to_f64(r)))
+        }
         // String concat
         (BinaryOp::Concat, Value::String(a), Value::String(b)) => Value::String(a + &b),
         (BinaryOp::Concat, l, r) => {
@@ -308,11 +362,13 @@ fn apply_and(l: Value, r: Value) -> Result<Value> {
         (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Value::Boolean(false),
         (Value::Boolean(true), Value::Boolean(true)) => Value::Boolean(true),
         (Value::Null, _) | (_, Value::Null) => Value::Null,
-        (a, b) => return Err(Error::ty(format!(
-            "AND requires booleans, got {} and {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        (a, b) => {
+            return Err(Error::ty(format!(
+                "AND requires booleans, got {} and {}",
+                a.type_name(),
+                b.type_name()
+            )));
+        }
     })
 }
 
@@ -321,11 +377,13 @@ fn apply_or(l: Value, r: Value) -> Result<Value> {
         (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Value::Boolean(true),
         (Value::Boolean(false), Value::Boolean(false)) => Value::Boolean(false),
         (Value::Null, _) | (_, Value::Null) => Value::Null,
-        (a, b) => return Err(Error::ty(format!(
-            "OR requires booleans, got {} and {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        (a, b) => {
+            return Err(Error::ty(format!(
+                "OR requires booleans, got {} and {}",
+                a.type_name(),
+                b.type_name()
+            )));
+        }
     })
 }
 
@@ -355,7 +413,10 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
         )));
     }
     // Most builtins propagate NULL — evaluate args once and short-circuit.
-    let evaled: Vec<Value> = args.iter().map(|a| eval_with(a, r)).collect::<Result<_>>()?;
+    let evaled: Vec<Value> = args
+        .iter()
+        .map(|a| eval_with(a, r))
+        .collect::<Result<_>>()?;
     match upper.as_str() {
         "ABS" => unary_numeric(&evaled, |x| x.abs(), |x: i64| x.wrapping_abs()),
         "ROUND" => unary_float(&evaled, f64::round),
@@ -367,7 +428,10 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
             match &evaled[0] {
                 Value::Null => Ok(Value::Null),
                 Value::String(s) => Ok(Value::Integer(s.chars().count() as i64)),
-                other => Err(Error::ty(format!("LENGTH expects string, got {}", other.type_name()))),
+                other => Err(Error::ty(format!(
+                    "LENGTH expects string, got {}",
+                    other.type_name()
+                ))),
             }
         }
         "LOWER" => string_unary(name, &evaled, |s| s.to_lowercase()),
@@ -430,14 +494,18 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
         "CONCAT" => {
             let mut out = String::new();
             for v in &evaled {
-                if v.is_null() { return Ok(Value::Null); }
+                if v.is_null() {
+                    return Ok(Value::Null);
+                }
                 out.push_str(&v.to_string());
             }
             Ok(Value::String(out))
         }
         "COALESCE" => {
             for v in &evaled {
-                if !v.is_null() { return Ok(v.clone()); }
+                if !v.is_null() {
+                    return Ok(v.clone());
+                }
             }
             Ok(Value::Null)
         }
@@ -476,17 +544,18 @@ fn check_arity(name: &str, want: usize, vs: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn unary_numeric(
-    vs: &[Value],
-    f: impl Fn(f64) -> f64,
-    g: impl Fn(i64) -> i64,
-) -> Result<Value> {
+fn unary_numeric(vs: &[Value], f: impl Fn(f64) -> f64, g: impl Fn(i64) -> i64) -> Result<Value> {
     check_arity("function", 1, vs)?;
     Ok(match &vs[0] {
         Value::Null => Value::Null,
         Value::Integer(n) => Value::Integer(g(*n)),
         Value::Float(x) => Value::Float(f(*x)),
-        other => return Err(Error::ty(format!("expected numeric, got {}", other.type_name()))),
+        other => {
+            return Err(Error::ty(format!(
+                "expected numeric, got {}",
+                other.type_name()
+            )));
+        }
     })
 }
 
@@ -496,7 +565,12 @@ fn unary_float(vs: &[Value], f: impl Fn(f64) -> f64) -> Result<Value> {
         Value::Null => Value::Null,
         Value::Integer(n) => Value::Float(f(*n as f64)),
         Value::Float(x) => Value::Float(f(*x)),
-        other => return Err(Error::ty(format!("expected numeric, got {}", other.type_name()))),
+        other => {
+            return Err(Error::ty(format!(
+                "expected numeric, got {}",
+                other.type_name()
+            )));
+        }
     })
 }
 
@@ -505,7 +579,12 @@ fn string_unary(name: &str, vs: &[Value], f: impl Fn(&str) -> String) -> Result<
     Ok(match &vs[0] {
         Value::Null => Value::Null,
         Value::String(s) => Value::String(f(s)),
-        other => return Err(Error::ty(format!("{name} expects string, got {}", other.type_name()))),
+        other => {
+            return Err(Error::ty(format!(
+                "{name} expects string, got {}",
+                other.type_name()
+            )));
+        }
     })
 }
 
@@ -516,12 +595,22 @@ fn substring(vs: &[Value]) -> Result<Value> {
     let s = match &vs[0] {
         Value::Null => return Ok(Value::Null),
         Value::String(s) => s.clone(),
-        other => return Err(Error::ty(format!("SUBSTRING expects string, got {}", other.type_name()))),
+        other => {
+            return Err(Error::ty(format!(
+                "SUBSTRING expects string, got {}",
+                other.type_name()
+            )));
+        }
     };
     let start = match &vs[1] {
         Value::Null => return Ok(Value::Null),
         Value::Integer(n) => *n,
-        other => return Err(Error::ty(format!("SUBSTRING start must be integer, got {}", other.type_name()))),
+        other => {
+            return Err(Error::ty(format!(
+                "SUBSTRING start must be integer, got {}",
+                other.type_name()
+            )));
+        }
     };
     // SQL is 1-based.
     let chars: Vec<char> = s.chars().collect();
@@ -531,7 +620,12 @@ fn substring(vs: &[Value]) -> Result<Value> {
         let take = match &vs[2] {
             Value::Null => return Ok(Value::Null),
             Value::Integer(n) => *n,
-            other => return Err(Error::ty(format!("SUBSTRING length must be integer, got {}", other.type_name()))),
+            other => {
+                return Err(Error::ty(format!(
+                    "SUBSTRING length must be integer, got {}",
+                    other.type_name()
+                )));
+            }
         };
         (start_idx + take.max(0) as usize).min(chars.len())
     } else {
@@ -779,7 +873,10 @@ mod tests {
     fn reverse_repeat_replace() {
         assert_eq!(ev("REVERSE('abc')"), Value::String("cba".into()));
         assert_eq!(ev("REPEAT('ab', 3)"), Value::String("ababab".into()));
-        assert_eq!(ev("REPLACE('hello', 'l', 'L')"), Value::String("heLLo".into()));
+        assert_eq!(
+            ev("REPLACE('hello', 'l', 'L')"),
+            Value::String("heLLo".into())
+        );
         assert_eq!(ev("REPEAT('x', 0)"), Value::String("".into()));
     }
 
@@ -836,7 +933,9 @@ mod tests {
                 Err(Error::ty(format!("unknown column `{name}`")))
             }
         }
-        fn qualified(&self, _: &str, _: &str) -> Result<Value> { Err(Error::ty("no qualified")) }
+        fn qualified(&self, _: &str, _: &str) -> Result<Value> {
+            Err(Error::ty("no qualified"))
+        }
     }
 
     #[test]
@@ -865,8 +964,10 @@ mod tests {
     #[test]
     fn case_switch_form() {
         // CASE expr WHEN val THEN ...
-        assert_eq!(ev("CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END"),
-            Value::String("b".into()));
+        assert_eq!(
+            ev("CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END"),
+            Value::String("b".into())
+        );
         assert_eq!(ev("CASE 'x' WHEN 'y' THEN 1 ELSE 2 END"), Value::Integer(2));
     }
 

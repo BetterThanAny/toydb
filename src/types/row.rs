@@ -9,22 +9,36 @@ use crate::types::value::Value;
 pub struct Row(pub Vec<Value>);
 
 impl Row {
-    pub fn new(values: Vec<Value>) -> Self { Self(values) }
+    pub fn new(values: Vec<Value>) -> Self {
+        Self(values)
+    }
 
-    pub fn len(&self) -> usize { self.0.len() }
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
-    pub fn get(&self, index: usize) -> Option<&Value> { self.0.get(index) }
-    pub fn into_inner(self) -> Vec<Value> { self.0 }
+    pub fn get(&self, index: usize) -> Option<&Value> {
+        self.0.get(index)
+    }
+    pub fn into_inner(self) -> Vec<Value> {
+        self.0
+    }
 }
 
 impl<I: IntoIterator<Item = Value>> From<I> for Row {
-    fn from(iter: I) -> Self { Self(iter.into_iter().collect()) }
+    fn from(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
 }
 
 impl std::ops::Index<usize> for Row {
     type Output = Value;
-    fn index(&self, i: usize) -> &Value { &self.0[i] }
+    fn index(&self, i: usize) -> &Value {
+        &self.0[i]
+    }
 }
 
 #[cfg(test)]

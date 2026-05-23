@@ -13,7 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::catalog::{Catalog, Table};
+use crate::catalog::{Catalog, Index, Table};
+use crate::engine::index::IndexStore;
 use crate::engine::{Engine, RowId};
 use crate::error::{Error, Result};
 use crate::storage::encoding::{decode_row, decode_table, encode_row, encode_table};
@@ -21,6 +22,7 @@ use crate::storage::page::{PageId, PageType};
 use crate::storage::pager::Pager;
 use crate::storage::wal::{LogRecord, Wal};
 use crate::types::row::Row;
+use crate::types::value::Value;
 
 const ROW_ID_PAGE_SHIFT: u32 = 16;
 const ROW_ID_SLOT_MASK: u64 = 0xFFFF;
@@ -39,6 +41,7 @@ pub struct DiskEngine {
     catalog: Catalog,
     /// Head data page id for each table, mirroring what lives on disk.
     table_heads: std::collections::HashMap<String, PageId>,
+    indexes: IndexStore,
 }
 
 impl DiskEngine {
@@ -53,11 +56,13 @@ impl DiskEngine {
 
         // Read catalog.
         let (catalog, table_heads) = read_catalog(&mut pager)?;
+        let indexes = rebuild_indexes(&mut pager, &catalog, &table_heads)?;
         Ok(Self {
             pager,
             wal,
             catalog,
             table_heads,
+            indexes,
         })
     }
 
@@ -104,6 +109,9 @@ impl Engine for DiskEngine {
         let head = self.pager.allocate(PageType::TableData)?;
         self.wal.append(&LogRecord::CreateTable(table.clone()))?;
         self.catalog.create_table(table.clone())?;
+        for index in &table.indexes {
+            self.indexes.rebuild(&index.name, std::iter::empty());
+        }
         self.table_heads.insert(table.name.clone(), head);
         self.rewrite_catalog()?;
         Ok(())
@@ -117,6 +125,7 @@ impl Engine for DiskEngine {
             return Err(Error::schema(format!("table `{name}` does not exist")));
         }
         self.wal.append(&LogRecord::DropTable(name.to_string()))?;
+        let table = self.catalog.get(name)?.clone();
         let head = *self
             .table_heads
             .get(name)
@@ -130,9 +139,46 @@ impl Engine for DiskEngine {
             cur = next;
         }
         self.catalog.drop_table(name)?;
+        for index in table.indexes {
+            self.indexes.drop(&index.name);
+        }
         self.table_heads.remove(name);
         self.rewrite_catalog()?;
         Ok(true)
+    }
+
+    fn create_index(&mut self, index: Index) -> Result<()> {
+        if self.catalog.index_exists(&index.name) {
+            return Err(Error::schema(format!(
+                "index `{}` already exists",
+                index.name
+            )));
+        }
+        let table = self.catalog.get(&index.table)?.clone();
+        let col_idx = table.column_index(&index.column)?;
+        self.wal.append(&LogRecord::CreateIndex(index.clone()))?;
+        self.catalog.create_index(index.clone())?;
+        self.rewrite_catalog()?;
+        let rows = scan_table_pages(&mut self.pager, &self.table_heads, &index.table)?;
+        self.indexes.rebuild(
+            &index.name,
+            rows.into_iter()
+                .map(|(id, row)| (row.0[col_idx].clone(), id)),
+        );
+        Ok(())
+    }
+
+    fn drop_index(&mut self, name: &str) -> Result<()> {
+        let index = self
+            .catalog
+            .find_index(name)
+            .cloned()
+            .ok_or_else(|| Error::schema(format!("index `{name}` does not exist")))?;
+        self.wal.append(&LogRecord::DropIndex(name.to_string()))?;
+        self.catalog.drop_index(name)?;
+        self.rewrite_catalog()?;
+        self.indexes.drop(&index.name);
+        Ok(())
     }
 
     fn get_table(&self, name: &str) -> Result<&Table> {
@@ -186,31 +232,19 @@ impl Engine for DiskEngine {
         self.wal.append(&LogRecord::Insert {
             table: table.to_string(),
             id,
-            row,
+            row: row.clone(),
         })?;
         self.pager.flush()?;
+        for index in &table_def.indexes {
+            let col_idx = table_def.column_index(&index.column)?;
+            self.indexes.insert(&index.name, &row.0[col_idx], id);
+        }
         Ok(id)
     }
 
     fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>> {
         let _ = self.catalog.get(table)?;
-        let head = *self
-            .table_heads
-            .get(table)
-            .ok_or_else(|| Error::internal(format!("missing head for `{table}`")))?;
-        let mut out = Vec::new();
-        let mut cur = head;
-        while cur != 0 {
-            let page = self.pager.read_page(cur)?;
-            for (slot, bytes) in page.iter() {
-                let id = make_row_id(cur, slot);
-                let mut s = bytes;
-                let row = decode_row(&mut s)?;
-                out.push((id, row));
-            }
-            cur = page.next_page();
-        }
-        Ok(out)
+        scan_table_pages(&mut self.pager, &self.table_heads, table)
     }
 
     fn update(&mut self, table: &str, id: RowId, row: Row) -> Result<()> {
@@ -225,6 +259,17 @@ impl Engine for DiskEngine {
         )?;
         let (page_id, slot) = split_row_id(id);
         let mut page = self.pager.read_page(page_id)?;
+        let old_row = match page.get(slot) {
+            Some(bytes) => {
+                let mut s = bytes;
+                decode_row(&mut s)?
+            }
+            None => {
+                return Err(Error::internal(format!(
+                    "update target row {id} no longer exists"
+                )));
+            }
+        };
         let mut buf = Vec::new();
         encode_row(&row, &mut buf);
         page.update(slot, &buf)?;
@@ -232,16 +277,28 @@ impl Engine for DiskEngine {
         self.wal.append(&LogRecord::Update {
             table: table.to_string(),
             id,
-            row,
+            row: row.clone(),
         })?;
         self.pager.flush()?;
+        for index in &table_def.indexes {
+            let col_idx = table_def.column_index(&index.column)?;
+            self.indexes.remove(&index.name, &old_row.0[col_idx], id);
+            self.indexes.insert(&index.name, &row.0[col_idx], id);
+        }
         Ok(())
     }
 
     fn delete(&mut self, table: &str, id: RowId) -> Result<()> {
-        let _ = self.catalog.get(table)?;
+        let table_def = self.catalog.get(table)?.clone();
         let (page_id, slot) = split_row_id(id);
         let mut page = self.pager.read_page(page_id)?;
+        let old_row = match page.get(slot) {
+            Some(bytes) => {
+                let mut s = bytes;
+                Some(decode_row(&mut s)?)
+            }
+            None => None,
+        };
         page.delete(slot)?;
         self.pager.write_page(page_id, page)?;
         self.wal.append(&LogRecord::Delete {
@@ -249,6 +306,12 @@ impl Engine for DiskEngine {
             id,
         })?;
         self.pager.flush()?;
+        if let Some(old_row) = old_row {
+            for index in &table_def.indexes {
+                let col_idx = table_def.column_index(&index.column)?;
+                self.indexes.remove(&index.name, &old_row.0[col_idx], id);
+            }
+        }
         Ok(())
     }
 
@@ -263,6 +326,31 @@ impl Engine for DiskEngine {
                 Ok(Some(decode_row(&mut s)?))
             }
         }
+    }
+
+    fn lookup_index(
+        &mut self,
+        table: &str,
+        index: &str,
+        value: &Value,
+    ) -> Result<Vec<(RowId, Row)>> {
+        let meta = self
+            .catalog
+            .find_index(index)
+            .ok_or_else(|| Error::schema(format!("index `{index}` does not exist")))?;
+        if meta.table != table {
+            return Err(Error::schema(format!(
+                "index `{index}` belongs to `{}`, not `{table}`",
+                meta.table
+            )));
+        }
+        let mut out = Vec::new();
+        for id in self.indexes.lookup(index, value) {
+            if let Some(row) = self.get(table, id)? {
+                out.push((id, row));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -335,6 +423,51 @@ fn check_unique_disk(
         }
     }
     Ok(())
+}
+
+fn scan_table_pages(
+    pager: &mut Pager,
+    heads: &std::collections::HashMap<String, PageId>,
+    table: &str,
+) -> Result<Vec<(RowId, Row)>> {
+    let head = *heads
+        .get(table)
+        .ok_or_else(|| Error::internal(format!("missing head for `{table}`")))?;
+    let mut out = Vec::new();
+    let mut cur = head;
+    while cur != 0 {
+        let page = pager.read_page(cur)?;
+        for (slot, bytes) in page.iter() {
+            let id = make_row_id(cur, slot);
+            let mut s = bytes;
+            let row = decode_row(&mut s)?;
+            out.push((id, row));
+        }
+        cur = page.next_page();
+    }
+    Ok(out)
+}
+
+fn rebuild_indexes(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    heads: &std::collections::HashMap<String, PageId>,
+) -> Result<IndexStore> {
+    let mut store = IndexStore::default();
+    for (_name, table) in catalog.iter() {
+        if table.indexes.is_empty() {
+            continue;
+        }
+        let rows = scan_table_pages(pager, heads, &table.name)?;
+        for index in &table.indexes {
+            let col_idx = table.column_index(&index.column)?;
+            store.rebuild(
+                &index.name,
+                rows.iter().map(|(id, row)| (row.0[col_idx].clone(), *id)),
+            );
+        }
+    }
+    Ok(store)
 }
 
 // ---------------------------------------------------------------------
@@ -465,6 +598,17 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 catalog.drop_table(name)?;
                 heads.remove(name);
             }
+            LogRecord::CreateIndex(index) => {
+                if !catalog.contains(&index.table) || catalog.index_exists(&index.name) {
+                    continue;
+                }
+                catalog.create_index(index.clone())?;
+            }
+            LogRecord::DropIndex(name) => {
+                if catalog.index_exists(name) {
+                    catalog.drop_index(name)?;
+                }
+            }
             LogRecord::Insert { table, id, row } => {
                 if !catalog.contains(table) {
                     // Table was dropped later in the WAL; the
@@ -544,7 +688,7 @@ fn has_later_record_for_row(recs: &[LogRecord], idx: usize, table: &str, id: Row
             id: later_id,
         } => later_table == table && *later_id == id,
         LogRecord::DropTable(name) => name == table,
-        LogRecord::CreateTable(_) => false,
+        LogRecord::CreateTable(_) | LogRecord::CreateIndex(_) | LogRecord::DropIndex(_) => false,
     })
 }
 

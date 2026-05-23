@@ -10,6 +10,6 @@ pub mod expr;
 pub mod plan;
 pub mod result;
 
-pub use expr::{eval, eval_with, Resolver};
+pub use expr::{Resolver, eval, eval_with};
 pub use plan::Executor;
 pub use result::{Column as ResultColumn, ResultSet};

@@ -24,6 +24,8 @@ pub fn render(rs: &ResultSet) -> String {
         }
         ResultSet::CreateTable { name } => format!("CREATE TABLE {name}\n"),
         ResultSet::AlterTable { name } => format!("ALTER TABLE {name}\n"),
+        ResultSet::CreateIndex { name } => format!("CREATE INDEX {name}\n"),
+        ResultSet::DropIndex { name } => format!("DROP INDEX {name}\n"),
         ResultSet::DropTable { name, existed } => {
             if *existed {
                 format!("DROP TABLE {name}\n")
@@ -67,7 +69,13 @@ fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
         let _ = writeln!(
             out,
             "| {}|",
-            (0..widths.iter().map(|w| w + 3).sum::<usize>().saturating_sub(2)).map(|_| ' ').collect::<String>()
+            (0..widths
+                .iter()
+                .map(|w| w + 3)
+                .sum::<usize>()
+                .saturating_sub(2))
+                .map(|_| ' ')
+                .collect::<String>()
         );
     } else {
         for row in rows {
@@ -75,7 +83,12 @@ fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
         }
     }
     write_separator(&mut out, &widths);
-    let _ = writeln!(out, "({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+    let _ = writeln!(
+        out,
+        "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
     out
 }
 

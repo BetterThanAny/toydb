@@ -70,17 +70,30 @@ impl Parser {
     // ------------------------------------------------------------------
 
     fn parse_statement_inner(&mut self) -> Result<Statement> {
-        let t = self.peek().cloned().ok_or_else(|| Error::parse(0, 0, "unexpected EOF"))?;
+        let t = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| Error::parse(0, 0, "unexpected EOF"))?;
         match &t.token {
             Token::KwSelect => self.parse_select().map(|s| Statement::Select(Box::new(s))),
             Token::KwInsert => self.parse_insert().map(|s| Statement::Insert(Box::new(s))),
             Token::KwUpdate => self.parse_update().map(|s| Statement::Update(Box::new(s))),
             Token::KwDelete => self.parse_delete().map(|s| Statement::Delete(Box::new(s))),
+            Token::KwCreate if matches!(self.peek_tok_at(1), Some(Token::KwIndex)) => self
+                .parse_create_index()
+                .map(|s| Statement::CreateIndex(Box::new(s))),
             Token::KwCreate => self
                 .parse_create_table()
                 .map(|s| Statement::CreateTable(Box::new(s))),
-            Token::KwDrop => self.parse_drop_table().map(|s| Statement::DropTable(Box::new(s))),
-            Token::KwAlter => self.parse_alter_table().map(|s| Statement::AlterTable(Box::new(s))),
+            Token::KwDrop if matches!(self.peek_tok_at(1), Some(Token::KwIndex)) => self
+                .parse_drop_index()
+                .map(|s| Statement::DropIndex(Box::new(s))),
+            Token::KwDrop => self
+                .parse_drop_table()
+                .map(|s| Statement::DropTable(Box::new(s))),
+            Token::KwAlter => self
+                .parse_alter_table()
+                .map(|s| Statement::AlterTable(Box::new(s))),
             Token::KwBegin => {
                 self.bump();
                 // Optional `TRANSACTION` keyword.
@@ -108,7 +121,10 @@ impl Parser {
                 let inner = self.parse_statement_inner()?;
                 Ok(Statement::Explain(Box::new(inner)))
             }
-            _ => Err(self.err_here(format!("unexpected start of statement: {}", t.token.as_str()))),
+            _ => Err(self.err_here(format!(
+                "unexpected start of statement: {}",
+                t.token.as_str()
+            ))),
         }
     }
 
@@ -124,7 +140,10 @@ impl Parser {
         while self.consume_if(&Token::KwUnion) {
             let all = self.consume_if(&Token::KwAll);
             let next = self.parse_select_core()?;
-            unions.push(UnionPart { all, query: Box::new(next) });
+            unions.push(UnionPart {
+                all,
+                query: Box::new(next),
+            });
         }
         // ORDER BY / LIMIT / OFFSET apply to the *combined* result.
         let (order_by, limit, offset) = self.parse_order_limit_offset()?;
@@ -212,14 +231,24 @@ impl Parser {
                 };
                 let nulls_first = if self.consume_if(&Token::KwNulls) {
                     match self.peek_tok() {
-                        Some(Token::KwFirst) => { self.bump(); true }
-                        Some(Token::KwLast) => { self.bump(); false }
+                        Some(Token::KwFirst) => {
+                            self.bump();
+                            true
+                        }
+                        Some(Token::KwLast) => {
+                            self.bump();
+                            false
+                        }
                         _ => return Err(self.err_here("expected NULLS FIRST or NULLS LAST")),
                     }
                 } else {
                     !asc
                 };
-                order_by.push(OrderBy { expr, asc, nulls_first });
+                order_by.push(OrderBy {
+                    expr,
+                    asc,
+                    nulls_first,
+                });
                 if !self.consume_if(&Token::Comma) {
                     break;
                 }
@@ -245,8 +274,7 @@ impl Parser {
             return Ok(SelectItem::Wildcard);
         }
         // `ident.*` qualified wildcard — we have to peek two tokens.
-        if let (Some(Token::Ident(name)), Some(Token::Dot)) =
-            (self.peek_tok(), self.peek_tok_at(1))
+        if let (Some(Token::Ident(name)), Some(Token::Dot)) = (self.peek_tok(), self.peek_tok_at(1))
         {
             // Star three tokens deep?
             if matches!(self.peek_tok_at(2), Some(Token::Star)) {
@@ -382,7 +410,11 @@ impl Parser {
             }
             _ => return Err(self.err_here("expected VALUES or SELECT after INSERT INTO ...")),
         };
-        Ok(InsertStmt { table, columns, source })
+        Ok(InsertStmt {
+            table,
+            columns,
+            source,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -408,7 +440,11 @@ impl Parser {
         } else {
             None
         };
-        Ok(UpdateStmt { table, assignments, r#where })
+        Ok(UpdateStmt {
+            table,
+            assignments,
+            r#where,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -451,7 +487,11 @@ impl Parser {
             }
         }
         self.expect(Token::RParen)?;
-        Ok(CreateTableStmt { name, if_not_exists, columns })
+        Ok(CreateTableStmt {
+            name,
+            if_not_exists,
+            columns,
+        })
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
@@ -494,11 +534,21 @@ impl Parser {
                 _ => break,
             }
         }
-        Ok(ColumnDef { name, ty, primary_key, nullable, unique, default })
+        Ok(ColumnDef {
+            name,
+            ty,
+            primary_key,
+            nullable,
+            unique,
+            default,
+        })
     }
 
     fn parse_data_type(&mut self) -> Result<DataType> {
-        let t = self.peek().cloned().ok_or_else(|| self.err_here("expected data type"))?;
+        let t = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| self.err_here("expected data type"))?;
         let ty = match &t.token {
             Token::KwBoolean | Token::KwBool => DataType::Boolean,
             Token::KwInteger | Token::KwInt => DataType::Integer,
@@ -539,7 +589,10 @@ impl Parser {
         // `COLUMN` is optional ergonomics, like Postgres.
         let _ = self.consume_if(&Token::KwColumn);
         let column = self.parse_column_def()?;
-        Ok(AlterTableStmt { name, action: AlterAction::AddColumn(column) })
+        Ok(AlterTableStmt {
+            name,
+            action: AlterAction::AddColumn(column),
+        })
     }
 
     fn parse_drop_table(&mut self) -> Result<DropTableStmt> {
@@ -553,6 +606,29 @@ impl Parser {
         };
         let name = self.expect_ident("table name")?;
         Ok(DropTableStmt { name, if_exists })
+    }
+
+    fn parse_create_index(&mut self) -> Result<CreateIndexStmt> {
+        self.expect(Token::KwCreate)?;
+        self.expect(Token::KwIndex)?;
+        let name = self.expect_ident("index name")?;
+        self.expect(Token::KwOn)?;
+        let table = self.expect_ident("table name")?;
+        self.expect(Token::LParen)?;
+        let column = self.expect_ident("column name")?;
+        self.expect(Token::RParen)?;
+        Ok(CreateIndexStmt {
+            name,
+            table,
+            column,
+        })
+    }
+
+    fn parse_drop_index(&mut self) -> Result<DropIndexStmt> {
+        self.expect(Token::KwDrop)?;
+        self.expect(Token::KwIndex)?;
+        let name = self.expect_ident("index name")?;
+        Ok(DropIndexStmt { name })
     }
 
     // ------------------------------------------------------------------
@@ -623,7 +699,10 @@ impl Parser {
         if self.consume_if(&Token::KwIs) {
             let negated = self.consume_if(&Token::KwNot);
             self.expect(Token::KwNull)?;
-            return Ok(Expression::IsNull { expr: Box::new(left), negated });
+            return Ok(Expression::IsNull {
+                expr: Box::new(left),
+                negated,
+            });
         }
         // [NOT] IN / BETWEEN / LIKE
         let negated = self.consume_if(&Token::KwNot);
@@ -639,7 +718,11 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen)?;
-            return Ok(Expression::InList { expr: Box::new(left), list, negated });
+            return Ok(Expression::InList {
+                expr: Box::new(left),
+                list,
+                negated,
+            });
         }
         if self.consume_if(&Token::KwLike) {
             let pattern = self.parse_concat()?;
@@ -711,7 +794,11 @@ impl Parser {
         if self.consume_if(&Token::Caret) {
             // right-associative
             let right = self.parse_exponent()?;
-            return Ok(Expression::Binary(Box::new(left), BinaryOp::Pow, Box::new(right)));
+            return Ok(Expression::Binary(
+                Box::new(left),
+                BinaryOp::Pow,
+                Box::new(right),
+            ));
         }
         Ok(left)
     }
@@ -733,7 +820,10 @@ impl Parser {
     }
 
     fn parse_atom(&mut self) -> Result<Expression> {
-        let t = self.peek().cloned().ok_or_else(|| self.err_here("unexpected EOF in expression"))?;
+        let t = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| self.err_here("unexpected EOF in expression"))?;
         match &t.token {
             Token::KwCase => self.parse_case(),
             Token::KwNull => {
@@ -802,7 +892,11 @@ impl Parser {
                         }
                     }
                     self.expect(Token::RParen)?;
-                    return Ok(Expression::Function { name, args, distinct });
+                    return Ok(Expression::Function {
+                        name,
+                        args,
+                        distinct,
+                    });
                 }
                 // qualified `t.col`?
                 if self.consume_if(&Token::Dot) {
@@ -845,7 +939,11 @@ impl Parser {
             None
         };
         self.expect(Token::KwEnd)?;
-        Ok(Expression::Case { operand, branches, otherwise })
+        Ok(Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -942,7 +1040,9 @@ mod tests {
 
     fn parse_expr(s: &str) -> Expression {
         let mut p = Parser::new(s).unwrap();
-        let e = p.parse_expression().unwrap_or_else(|e| panic!("expr error in `{s}`: {e}"));
+        let e = p
+            .parse_expression()
+            .unwrap_or_else(|e| panic!("expr error in `{s}`: {e}"));
         if let Some(rest) = p.peek().cloned() {
             panic!("trailing token after `{s}`: {}", rest.token.as_str());
         }
@@ -977,21 +1077,42 @@ mod tests {
     fn expr_arithmetic_left_assoc() {
         // 1 + 2 + 3 == ((1 + 2) + 3)
         let e = parse_expr("1 + 2 + 3");
-        assert_eq!(e, bin(bin(lit_int(1), BinaryOp::Add, lit_int(2)), BinaryOp::Add, lit_int(3)));
+        assert_eq!(
+            e,
+            bin(
+                bin(lit_int(1), BinaryOp::Add, lit_int(2)),
+                BinaryOp::Add,
+                lit_int(3)
+            )
+        );
     }
 
     #[test]
     fn expr_precedence_mul_over_add() {
         // 1 + 2 * 3 == (1 + (2 * 3))
         let e = parse_expr("1 + 2 * 3");
-        assert_eq!(e, bin(lit_int(1), BinaryOp::Add, bin(lit_int(2), BinaryOp::Mul, lit_int(3))));
+        assert_eq!(
+            e,
+            bin(
+                lit_int(1),
+                BinaryOp::Add,
+                bin(lit_int(2), BinaryOp::Mul, lit_int(3))
+            )
+        );
     }
 
     #[test]
     fn expr_exponent_right_assoc() {
         // 2 ^ 3 ^ 2 == (2 ^ (3 ^ 2))
         let e = parse_expr("2 ^ 3 ^ 2");
-        assert_eq!(e, bin(lit_int(2), BinaryOp::Pow, bin(lit_int(3), BinaryOp::Pow, lit_int(2))));
+        assert_eq!(
+            e,
+            bin(
+                lit_int(2),
+                BinaryOp::Pow,
+                bin(lit_int(3), BinaryOp::Pow, lit_int(2))
+            )
+        );
     }
 
     #[test]
@@ -1018,14 +1139,28 @@ mod tests {
     fn expr_paren() {
         // (1 + 2) * 3
         let e = parse_expr("(1 + 2) * 3");
-        assert_eq!(e, bin(bin(lit_int(1), BinaryOp::Add, lit_int(2)), BinaryOp::Mul, lit_int(3)));
+        assert_eq!(
+            e,
+            bin(
+                bin(lit_int(1), BinaryOp::Add, lit_int(2)),
+                BinaryOp::Mul,
+                lit_int(3)
+            )
+        );
     }
 
     #[test]
     fn expr_bool_logic_precedence() {
         // a OR b AND c -> a OR (b AND c)
         let e = parse_expr("a OR b AND c");
-        assert_eq!(e, bin(col("a"), BinaryOp::Or, bin(col("b"), BinaryOp::And, col("c"))));
+        assert_eq!(
+            e,
+            bin(
+                col("a"),
+                BinaryOp::Or,
+                bin(col("b"), BinaryOp::And, col("c"))
+            )
+        );
     }
 
     #[test]
@@ -1034,7 +1169,10 @@ mod tests {
         let e = parse_expr("NOT a = 1");
         assert_eq!(
             e,
-            Expression::Unary(UnaryOp::Not, Box::new(bin(col("a"), BinaryOp::Eq, lit_int(1))))
+            Expression::Unary(
+                UnaryOp::Not,
+                Box::new(bin(col("a"), BinaryOp::Eq, lit_int(1)))
+            )
         );
     }
 
@@ -1044,7 +1182,11 @@ mod tests {
         let s = |x: &str| Expression::Literal(Literal::String(x.into()));
         assert_eq!(
             e,
-            bin(bin(s("a"), BinaryOp::Concat, s("b")), BinaryOp::Concat, s("c"))
+            bin(
+                bin(s("a"), BinaryOp::Concat, s("b")),
+                BinaryOp::Concat,
+                s("c")
+            )
         );
     }
 
@@ -1058,11 +1200,17 @@ mod tests {
     fn expr_is_null_and_is_not_null() {
         assert_eq!(
             parse_expr("a IS NULL"),
-            Expression::IsNull { expr: Box::new(col("a")), negated: false }
+            Expression::IsNull {
+                expr: Box::new(col("a")),
+                negated: false
+            }
         );
         assert_eq!(
             parse_expr("a IS NOT NULL"),
-            Expression::IsNull { expr: Box::new(col("a")), negated: true }
+            Expression::IsNull {
+                expr: Box::new(col("a")),
+                negated: true
+            }
         );
     }
 
@@ -1100,7 +1248,11 @@ mod tests {
     fn expr_function_call() {
         let e = parse_expr("upper(name)");
         match e {
-            Expression::Function { name, args, distinct } => {
+            Expression::Function {
+                name,
+                args,
+                distinct,
+            } => {
                 assert_eq!(name, "upper");
                 assert_eq!(args, vec![col("name")]);
                 assert!(!distinct);
@@ -1113,7 +1265,11 @@ mod tests {
     fn expr_count_star() {
         let e = parse_expr("count(*)");
         match e {
-            Expression::Function { name, args, distinct } => {
+            Expression::Function {
+                name,
+                args,
+                distinct,
+            } => {
                 assert_eq!(name, "count");
                 assert_eq!(args, vec![Expression::Wildcard]);
                 assert!(!distinct);
@@ -1193,13 +1349,17 @@ mod tests {
 
     #[test]
     fn select_inner_join() {
-        let s = parse(
-            "SELECT u.id, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id",
-        );
+        let s = parse("SELECT u.id, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id");
         match s {
             Statement::Select(s) => {
                 let from = s.from.unwrap();
-                assert!(matches!(from, FromClause::Join { kind: JoinKind::Inner, .. }));
+                assert!(matches!(
+                    from,
+                    FromClause::Join {
+                        kind: JoinKind::Inner,
+                        ..
+                    }
+                ));
             }
             _ => panic!(),
         }
@@ -1211,7 +1371,13 @@ mod tests {
         match s {
             Statement::Select(s) => {
                 let from = s.from.unwrap();
-                assert!(matches!(from, FromClause::Join { kind: JoinKind::Left, .. }));
+                assert!(matches!(
+                    from,
+                    FromClause::Join {
+                        kind: JoinKind::Left,
+                        ..
+                    }
+                ));
             }
             _ => panic!(),
         }
@@ -1357,6 +1523,28 @@ mod tests {
         let s = parse("DROP TABLE IF EXISTS t");
         match s {
             Statement::DropTable(d) => assert!(d.if_exists),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn create_index() {
+        let s = parse("CREATE INDEX idx_users_age ON users(age)");
+        match s {
+            Statement::CreateIndex(i) => {
+                assert_eq!(i.name, "idx_users_age");
+                assert_eq!(i.table, "users");
+                assert_eq!(i.column, "age");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn drop_index() {
+        let s = parse("DROP INDEX idx_users_age");
+        match s {
+            Statement::DropIndex(i) => assert_eq!(i.name, "idx_users_age"),
             _ => panic!(),
         }
     }

@@ -11,9 +11,9 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use rustyline::DefaultEditor;
 use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
 
 use toydb::engine::{DiskEngine, Engine, MemoryEngine};
 use toydb::executor::Executor;
@@ -37,7 +37,11 @@ struct Args {
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { db: None, script: None, help: false };
+    let mut args = Args {
+        db: None,
+        script: None,
+        help: false,
+    };
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -191,14 +195,30 @@ fn print_schema(engine: &dyn Engine, name: &str) {
                 println!("CREATE TABLE {} (", t.name);
                 for (i, c) in t.columns.iter().enumerate() {
                     let mut line = format!("    {} {}", c.name, c.ty);
-                    if c.primary_key { line.push_str(" PRIMARY KEY"); }
-                    if c.unique && !c.primary_key { line.push_str(" UNIQUE"); }
-                    if !c.nullable && !c.primary_key { line.push_str(" NOT NULL"); }
-                    if c.default.is_some() { line.push_str(" DEFAULT ..."); }
-                    if i + 1 < t.columns.len() { line.push(','); }
+                    if c.primary_key {
+                        line.push_str(" PRIMARY KEY");
+                    }
+                    if c.unique && !c.primary_key {
+                        line.push_str(" UNIQUE");
+                    }
+                    if !c.nullable && !c.primary_key {
+                        line.push_str(" NOT NULL");
+                    }
+                    if c.default.is_some() {
+                        line.push_str(" DEFAULT ...");
+                    }
+                    if i + 1 < t.columns.len() {
+                        line.push(',');
+                    }
                     println!("{line}");
                 }
                 println!(");");
+                for index in &t.indexes {
+                    println!(
+                        "CREATE INDEX {} ON {}({});",
+                        index.name, index.table, index.column
+                    );
+                }
             }
             Err(e) => eprintln!("error: {e}"),
         }

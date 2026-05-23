@@ -15,13 +15,35 @@ impl Column {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultSet {
-    CreateTable { name: String },
-    DropTable { name: String, existed: bool },
-    AlterTable { name: String },
-    Insert { count: usize },
-    Update { count: usize },
-    Delete { count: usize },
-    Select { columns: Vec<Column>, rows: Vec<Row> },
+    CreateTable {
+        name: String,
+    },
+    DropTable {
+        name: String,
+        existed: bool,
+    },
+    AlterTable {
+        name: String,
+    },
+    CreateIndex {
+        name: String,
+    },
+    DropIndex {
+        name: String,
+    },
+    Insert {
+        count: usize,
+    },
+    Update {
+        count: usize,
+    },
+    Delete {
+        count: usize,
+    },
+    Select {
+        columns: Vec<Column>,
+        rows: Vec<Row>,
+    },
     Begin,
     Commit,
     Rollback,

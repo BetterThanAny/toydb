@@ -252,7 +252,12 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        Self { input: input.as_bytes(), pos: 0, line: 1, col: 1 }
+        Self {
+            input: input.as_bytes(),
+            pos: 0,
+            line: 1,
+            col: 1,
+        }
     }
 
     /// Lex the whole input into a vector. Convenient for testing; the
@@ -410,7 +415,11 @@ impl<'a> Lexer<'a> {
                             }
                             (Some(_), _) => self.advance(1),
                             (None, _) => {
-                                return Err(Error::lex(line, col, "unterminated /* ... */ comment"));
+                                return Err(Error::lex(
+                                    line,
+                                    col,
+                                    "unterminated /* ... */ comment",
+                                ));
                             }
                         }
                     }
@@ -500,9 +509,8 @@ impl<'a> Lexer<'a> {
                     if end > self.input.len() {
                         return Err(Error::lex(self.line, self.col, "invalid UTF-8 in string"));
                     }
-                    let s = std::str::from_utf8(&rest[..ch_len]).map_err(|_| {
-                        Error::lex(self.line, self.col, "invalid UTF-8 in string")
-                    })?;
+                    let s = std::str::from_utf8(&rest[..ch_len])
+                        .map_err(|_| Error::lex(self.line, self.col, "invalid UTF-8 in string"))?;
                     out.push_str(s);
                     self.advance(ch_len);
                 }
@@ -532,10 +540,9 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b) => {
                     let ch_len = utf8_char_len(b);
-                    let s = std::str::from_utf8(&self.input[self.pos..self.pos + ch_len])
-                        .map_err(|_| {
-                            Error::lex(self.line, self.col, "invalid UTF-8 in identifier")
-                        })?;
+                    let s = std::str::from_utf8(&self.input[self.pos..self.pos + ch_len]).map_err(
+                        |_| Error::lex(self.line, self.col, "invalid UTF-8 in identifier"),
+                    )?;
                     out.push_str(s);
                     self.advance(ch_len);
                 }
@@ -578,7 +585,11 @@ mod tests {
     use super::*;
 
     fn lex(input: &str) -> Vec<Token> {
-        Lexer::collect_all(input).unwrap().into_iter().map(|s| s.token).collect()
+        Lexer::collect_all(input)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.token)
+            .collect()
     }
 
     fn lex_err(input: &str) -> String {
@@ -629,39 +640,51 @@ mod tests {
 
     #[test]
     fn integer_literals() {
-        assert_eq!(lex("42 0 1234567890"), vec![
-            Token::Number("42".into()),
-            Token::Number("0".into()),
-            Token::Number("1234567890".into()),
-        ]);
+        assert_eq!(
+            lex("42 0 1234567890"),
+            vec![
+                Token::Number("42".into()),
+                Token::Number("0".into()),
+                Token::Number("1234567890".into()),
+            ]
+        );
     }
 
     #[test]
     fn float_literals() {
-        assert_eq!(lex("3.14 0.5 100.0"), vec![
-            Token::Number("3.14".into()),
-            Token::Number("0.5".into()),
-            Token::Number("100.0".into()),
-        ]);
+        assert_eq!(
+            lex("3.14 0.5 100.0"),
+            vec![
+                Token::Number("3.14".into()),
+                Token::Number("0.5".into()),
+                Token::Number("100.0".into()),
+            ]
+        );
     }
 
     #[test]
     fn scientific_notation() {
-        assert_eq!(lex("1e10 1.5e-3 2E+5"), vec![
-            Token::Number("1e10".into()),
-            Token::Number("1.5e-3".into()),
-            Token::Number("2E+5".into()),
-        ]);
+        assert_eq!(
+            lex("1e10 1.5e-3 2E+5"),
+            vec![
+                Token::Number("1e10".into()),
+                Token::Number("1.5e-3".into()),
+                Token::Number("2E+5".into()),
+            ]
+        );
     }
 
     #[test]
     fn dotted_path_after_number_not_floats() {
         // `1.foo` should be Number(1), Dot, Ident(foo) — fractional needs digits.
-        assert_eq!(lex("1.foo"), vec![
-            Token::Number("1".into()),
-            Token::Dot,
-            Token::Ident("foo".into()),
-        ]);
+        assert_eq!(
+            lex("1.foo"),
+            vec![
+                Token::Number("1".into()),
+                Token::Dot,
+                Token::Ident("foo".into()),
+            ]
+        );
     }
 
     #[test]

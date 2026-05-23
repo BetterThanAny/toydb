@@ -5,14 +5,16 @@
 //! disk-backed one is a one-line change in `main`.
 
 pub mod disk;
+mod index;
 pub mod memory;
 
 pub use disk::DiskEngine;
 pub use memory::MemoryEngine;
 
-use crate::catalog::Table;
+use crate::catalog::{Index, Table};
 use crate::error::Result;
 use crate::types::row::Row;
+use crate::types::value::Value;
 
 /// Synthetic row identifier used for UPDATE/DELETE targeting. Memory
 /// and disk backends both keep this stable for the life of a row.
@@ -25,6 +27,8 @@ pub trait Engine {
     // -- DDL -----------------------------------------------------------
     fn create_table(&mut self, table: Table) -> Result<()>;
     fn drop_table(&mut self, name: &str, if_exists: bool) -> Result<bool>;
+    fn create_index(&mut self, index: Index) -> Result<()>;
+    fn drop_index(&mut self, name: &str) -> Result<()>;
     fn get_table(&self, name: &str) -> Result<&Table>;
     fn list_tables(&self) -> Vec<String>;
 
@@ -37,6 +41,12 @@ pub trait Engine {
     fn update(&mut self, table: &str, id: RowId, row: Row) -> Result<()>;
     fn delete(&mut self, table: &str, id: RowId) -> Result<()>;
     fn get(&mut self, table: &str, id: RowId) -> Result<Option<Row>>;
+    fn lookup_index(
+        &mut self,
+        table: &str,
+        index: &str,
+        value: &Value,
+    ) -> Result<Vec<(RowId, Row)>>;
 
     // -- Transactions --------------------------------------------------
     //

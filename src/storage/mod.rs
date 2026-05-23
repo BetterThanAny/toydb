@@ -12,7 +12,9 @@ pub mod page;
 pub mod pager;
 pub mod wal;
 
-pub use encoding::{decode_row, decode_table, decode_value, encode_row, encode_table, encode_value};
-pub use page::{Page, PageId, PageType, PAGE_SIZE};
+pub use encoding::{
+    decode_row, decode_table, decode_value, encode_row, encode_table, encode_value,
+};
+pub use page::{PAGE_SIZE, Page, PageId, PageType};
 pub use pager::Pager;
 pub use wal::{LogRecord, Wal};
