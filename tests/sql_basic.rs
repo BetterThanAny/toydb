@@ -88,6 +88,55 @@ fn unique_violation_propagates() {
 }
 
 #[test]
+fn multi_value_insert_is_atomic_on_constraint_failure() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE u (id INT PRIMARY KEY, v TEXT UNIQUE);
+        INSERT INTO u VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    ",
+    );
+
+    let err = try_run(&mut e, "INSERT INTO u VALUES (4, 'd'), (5, 'a')").unwrap_err();
+    assert!(err.contains("duplicate"));
+
+    let r = run(&mut e, "SELECT id, v FROM u ORDER BY id");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[2][0], Value::Integer(3));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn update_is_atomic_on_constraint_failure() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE u (id INT PRIMARY KEY, v TEXT UNIQUE);
+        INSERT INTO u VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    ",
+    );
+
+    let err = try_run(&mut e, "UPDATE u SET v = 'x'").unwrap_err();
+    assert!(err.contains("duplicate"));
+
+    let r = run(&mut e, "SELECT id, v FROM u ORDER BY id");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows[0][1], Value::String("a".into()));
+            assert_eq!(rows[1][1], Value::String("b".into()));
+            assert_eq!(rows[2][1], Value::String("c".into()));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn duplicate_insert_columns_are_rejected() {
     let mut e = MemoryEngine::new();
     run_all(&mut e, "CREATE TABLE t (a INT, b INT)");
@@ -231,6 +280,18 @@ fn alter_table_rejects_bad_default_type_without_schema_change() {
 }
 
 #[test]
+fn create_table_rejects_bad_default_type() {
+    let mut e = MemoryEngine::new();
+    let err = try_run(
+        &mut e,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT DEFAULT 'bad')",
+    )
+    .unwrap_err();
+    assert!(err.contains("DEFAULT"), "{err}");
+    assert!(try_run(&mut e, "SELECT * FROM t").is_err());
+}
+
+#[test]
 fn primary_key_null_is_still_not_nullable() {
     let mut e = MemoryEngine::new();
     run_all(&mut e, "CREATE TABLE t (id INT PRIMARY KEY NULL)");
@@ -308,6 +369,40 @@ fn multi_value_insert() {
         ResultSet::Insert { count } => assert_eq!(count, 5),
         _ => panic!(),
     }
+}
+
+#[test]
+fn distinct_is_applied_before_offset() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT PRIMARY KEY, c INT);
+        INSERT INTO t VALUES (1, 10), (2, 10), (3, 20);
+    ",
+    );
+    let r = run(&mut e, "SELECT DISTINCT c FROM t ORDER BY c OFFSET 1");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(20));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn count_distinct_star_is_rejected() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT PRIMARY KEY);
+        INSERT INTO t VALUES (1), (2);
+    ",
+    );
+    let err = try_run(&mut e, "SELECT COUNT(DISTINCT *) FROM t").unwrap_err();
+    assert!(err.contains("DISTINCT"), "{err}");
 }
 
 #[test]

@@ -256,7 +256,10 @@ fn apply_unary(op: UnaryOp, v: Value) -> Result<Value> {
     }
     Ok(match (op, v) {
         (UnaryOp::Plus, v @ (Value::Integer(_) | Value::Float(_))) => v,
-        (UnaryOp::Minus, Value::Integer(n)) => Value::Integer(n.wrapping_neg()),
+        (UnaryOp::Minus, Value::Integer(n)) => Value::Integer(
+            n.checked_neg()
+                .ok_or_else(|| Error::value("integer negation overflow"))?,
+        ),
         (UnaryOp::Minus, Value::Float(f)) => Value::Float(-f),
         (UnaryOp::Not, Value::Boolean(b)) => Value::Boolean(!b),
         (op, v) => {
@@ -285,26 +288,46 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
     }
     Ok(match (op, l, r) {
         // Arithmetic
-        (BinaryOp::Add, Value::Integer(a), Value::Integer(b)) => Value::Integer(a.wrapping_add(b)),
-        (BinaryOp::Sub, Value::Integer(a), Value::Integer(b)) => Value::Integer(a.wrapping_sub(b)),
-        (BinaryOp::Mul, Value::Integer(a), Value::Integer(b)) => Value::Integer(a.wrapping_mul(b)),
+        (BinaryOp::Add, Value::Integer(a), Value::Integer(b)) => Value::Integer(
+            a.checked_add(b)
+                .ok_or_else(|| Error::value("integer addition overflow"))?,
+        ),
+        (BinaryOp::Sub, Value::Integer(a), Value::Integer(b)) => Value::Integer(
+            a.checked_sub(b)
+                .ok_or_else(|| Error::value("integer subtraction overflow"))?,
+        ),
+        (BinaryOp::Mul, Value::Integer(a), Value::Integer(b)) => Value::Integer(
+            a.checked_mul(b)
+                .ok_or_else(|| Error::value("integer multiplication overflow"))?,
+        ),
         (BinaryOp::Div, Value::Integer(a), Value::Integer(b)) => {
             if b == 0 {
                 return Err(Error::value("integer division by zero"));
             }
-            Value::Integer(a.wrapping_div(b))
+            Value::Integer(
+                a.checked_div(b)
+                    .ok_or_else(|| Error::value("integer division overflow"))?,
+            )
         }
         (BinaryOp::Mod, Value::Integer(a), Value::Integer(b)) => {
             if b == 0 {
                 return Err(Error::value("integer modulo by zero"));
             }
-            Value::Integer(a.wrapping_rem(b))
+            Value::Integer(
+                a.checked_rem(b)
+                    .ok_or_else(|| Error::value("integer modulo overflow"))?,
+            )
         }
         (BinaryOp::Pow, Value::Integer(a), Value::Integer(b)) => {
             if b < 0 {
                 Value::Float((a as f64).powi(b as i32))
             } else {
-                Value::Integer((a as f64).powi(b as i32) as i64)
+                let exp =
+                    u32::try_from(b).map_err(|_| Error::value("integer exponent out of range"))?;
+                Value::Integer(
+                    a.checked_pow(exp)
+                        .ok_or_else(|| Error::value("integer exponent overflow"))?,
+                )
             }
         }
         (BinaryOp::Add, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) + to_f64(r)),
@@ -731,6 +754,12 @@ mod tests {
     #[test]
     fn arith_div_by_zero() {
         assert!(ev_err("1 / 0").contains("division by zero"));
+    }
+
+    #[test]
+    fn integer_overflow_errors() {
+        assert!(ev_err("9223372036854775807 + 1").contains("overflow"));
+        assert!(ev_err("9223372036854775807 * 2").contains("overflow"));
     }
 
     #[test]

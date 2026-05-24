@@ -462,14 +462,14 @@ impl<'a> Lexer<'a> {
         }
         // optional exponent
         if matches!(self.peek(), Some(b'e' | b'E')) {
-            let save = self.pos;
+            let exp_line = self.line;
+            let exp_col = self.col;
             self.advance(1);
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.advance(1);
             }
             if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                // not a real exponent — rewind
-                self.pos = save;
+                return Err(Error::lex(exp_line, exp_col, "invalid numeric exponent"));
             } else {
                 while matches!(self.peek(), Some(b'0'..=b'9')) {
                     self.advance(1);
@@ -672,6 +672,13 @@ mod tests {
                 Token::Number("2E+5".into()),
             ]
         );
+    }
+
+    #[test]
+    fn malformed_exponent_errors() {
+        let err = lex_err("1e + 2");
+        assert!(err.contains("invalid numeric exponent"), "{err}");
+        assert!(err.contains("line 1, col 2"), "{err}");
     }
 
     #[test]

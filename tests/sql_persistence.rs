@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use toydb::engine::{DiskEngine, Engine};
 use toydb::executor::{Executor, ResultSet};
 use toydb::sql::Parser;
+use toydb::storage::PAGE_SIZE;
 use toydb::types::value::Value;
 
 fn tmpdb() -> PathBuf {
@@ -127,7 +128,11 @@ fn failed_oversized_update_keeps_old_row() {
             &format!("UPDATE t SET payload = '{big}' WHERE id = 1"),
         )
         .unwrap_err();
-        assert!(err.contains("reallocation") || err.contains("page full"));
+        assert!(
+            err.contains("row for table")
+                || err.contains("reallocation")
+                || err.contains("page full")
+        );
 
         let r = run(&mut e, "SELECT id, payload FROM t");
         match r {
@@ -207,6 +212,59 @@ fn unique_constraint_persists() {
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("duplicate"));
     }
+    cleanup(&path);
+}
+
+#[test]
+fn disk_multi_value_insert_failure_is_atomic() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE u (id INT PRIMARY KEY, email TEXT UNIQUE);
+            INSERT INTO u VALUES (1, 'a@x'), (2, 'b@x');
+        ",
+        );
+        let err = try_run(&mut e, "INSERT INTO u VALUES (3, 'c@x'), (4, 'a@x')").unwrap_err();
+        assert!(err.contains("duplicate"));
+        e.checkpoint().unwrap();
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT id FROM u ORDER BY id");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[1][0], Value::Integer(2));
+            }
+            _ => panic!(),
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn corrupted_page_header_returns_error_instead_of_panicking() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(&mut e, "CREATE TABLE t (id INT PRIMARY KEY)");
+        e.checkpoint().unwrap();
+    }
+
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(SeekFrom::Start((2 * PAGE_SIZE + 4) as u64)).unwrap();
+    f.write_all(&2000u32.to_le_bytes()).unwrap();
+
+    let err = match DiskEngine::open(&path) {
+        Ok(_) => panic!("corrupted database opened successfully"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("invalid page slot count"), "{err}");
     cleanup(&path);
 }
 

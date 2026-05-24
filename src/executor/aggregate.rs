@@ -100,6 +100,9 @@ fn collect_inner(
                     return Err(Error::ty(format!("{} takes 1 argument, got {n}", k.name())));
                 }
             }
+            if *distinct && matches!(args[0], Expression::Wildcard) {
+                return Err(Error::ty("DISTINCT cannot be used with *"));
+            }
             for a in args {
                 collect_inner(a, out, true)?;
             }
@@ -237,7 +240,11 @@ impl Accumulator {
                 self.count += 1;
                 match value {
                     Value::Integer(n) => match (self.sum_int, self.sum_float) {
-                        (Some(acc), None) => self.sum_int = Some(acc.wrapping_add(n)),
+                        (Some(acc), None) => {
+                            self.sum_int = Some(acc.checked_add(n).ok_or_else(|| {
+                                Error::value(format!("{} integer overflow", self.kind.name()))
+                            })?)
+                        }
                         (_, Some(acc)) => self.sum_float = Some(acc + n as f64),
                         _ => unreachable!(),
                     },

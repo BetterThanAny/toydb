@@ -81,6 +81,9 @@ impl Wal {
             let len = u32::from_le_bytes(slice[..4].try_into().unwrap()) as usize;
             slice = &slice[4..];
             if slice.len() < len {
+                if !out.is_empty() {
+                    return Err(Error::other("WAL: truncated record after valid prefix"));
+                }
                 // Tail-truncated WAL — ignore the partial record. This
                 // matches "torn write" semantics: the last commit either
                 // fully made it to disk or didn't.
@@ -89,13 +92,18 @@ impl Wal {
             let payload = &slice[..len];
             slice = &slice[len..];
             let mut p = payload;
-            out.push(decode_record(&mut p)?);
+            let rec = decode_record(&mut p)?;
+            if !p.is_empty() {
+                return Err(Error::other("WAL: trailing bytes in record payload"));
+            }
+            out.push(rec);
         }
         Ok(out)
     }
 
     pub fn truncate(&mut self) -> Result<()> {
         self.file.set_len(0)?;
+        self.file.sync_data()?;
         self.file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -339,6 +347,29 @@ mod tests {
         let recs = w.replay().unwrap();
         // First record is read, partial trailer is silently skipped.
         assert_eq!(recs.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn truncated_record_after_valid_prefix_errors() {
+        let path = tmppath();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.append(&LogRecord::Delete {
+                table: "t".into(),
+                id: 7,
+            })
+            .unwrap();
+        }
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&100u32.to_le_bytes())
+            .unwrap();
+        let mut w = Wal::open(&path).unwrap();
+        let err = w.replay().unwrap_err().to_string();
+        assert!(err.contains("truncated record after valid prefix"), "{err}");
         std::fs::remove_file(&path).ok();
     }
 

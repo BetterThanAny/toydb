@@ -75,7 +75,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(path) = args.script {
         let sql = std::fs::read_to_string(&path)?;
-        run_script(engine.as_mut(), &sql);
+        run_script(engine.as_mut(), &sql)?;
         // `engine` is dropped at end of scope; if it's a DiskEngine, the
         // Drop impl flushes pending pages. The WAL is durable already.
         return Ok(());
@@ -154,23 +154,18 @@ fn execute_buffer(engine: &mut dyn Engine, sql: &str) {
     }
 }
 
-fn run_script(engine: &mut dyn Engine, sql: &str) {
+fn run_script(engine: &mut dyn Engine, sql: &str) -> Result<(), Box<dyn std::error::Error>> {
     let stmts = match Parser::parse_all(sql) {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("parse error: {e}");
-            return;
-        }
+        Err(e) => return Err(Box::new(e)),
     };
     for stmt in stmts {
         match Executor::new(engine).execute(&stmt) {
             Ok(rs) => print!("{}", render(&rs)),
-            Err(e) => {
-                eprintln!("error: {e}");
-                return;
-            }
+            Err(e) => return Err(Box::new(e)),
         }
     }
+    Ok(())
 }
 
 fn print_help() {

@@ -93,6 +93,56 @@ impl Page {
         PageType::from_byte(self.buf[0])
     }
 
+    pub fn validate(&self) -> Result<()> {
+        self.page_type()?;
+        let slot_count = self.slot_count() as usize;
+        let slot_end = HEADER_SIZE
+            .checked_add(
+                slot_count
+                    .checked_mul(SLOT_SIZE)
+                    .ok_or_else(|| Error::other(format!("invalid page slot count {slot_count}")))?,
+            )
+            .ok_or_else(|| Error::other("invalid page slot directory size"))?;
+        if slot_end > PAGE_SIZE {
+            return Err(Error::other(format!(
+                "invalid page slot count {slot_count}: slot directory exceeds page"
+            )));
+        }
+        let free_off = self.free_offset() as usize;
+        if !(slot_end..=PAGE_SIZE).contains(&free_off) {
+            return Err(Error::other(format!(
+                "invalid page free offset {free_off} for slot directory end {slot_end}"
+            )));
+        }
+        for i in 0..slot_count {
+            let (off, len) = self.slot(i);
+            if len == 0 {
+                if let Some((record_off, capacity)) = tombstone_info(off) {
+                    let start = record_off as usize;
+                    let end = start.checked_add(capacity).ok_or_else(|| {
+                        Error::other(format!("invalid tombstone slot {i}: overflow"))
+                    })?;
+                    if start < free_off || end > PAGE_SIZE {
+                        return Err(Error::other(format!(
+                            "invalid tombstone slot {i}: range {start}..{end} outside records"
+                        )));
+                    }
+                }
+                continue;
+            }
+            let start = off as usize;
+            let end = start
+                .checked_add(len as usize)
+                .ok_or_else(|| Error::other(format!("invalid slot {i}: overflow")))?;
+            if start < free_off || end > PAGE_SIZE {
+                return Err(Error::other(format!(
+                    "invalid slot {i}: range {start}..{end} outside records"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_page_type(&mut self, t: PageType) {
         self.buf[0] = t as u8;
     }

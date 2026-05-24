@@ -24,6 +24,8 @@ use crate::sql::ast::{
     DropIndexStmt, DropTableStmt, Expression, FromClause, InsertSource, InsertStmt, JoinKind,
     OrderBy, SelectItem, SelectStmt, Statement, UpdateStmt,
 };
+use crate::storage::encoding::encode_row;
+use crate::storage::page::{HEADER_SIZE, PAGE_SIZE, SLOT_SIZE};
 use crate::types::row::Row;
 use crate::types::value::Value;
 
@@ -258,11 +260,14 @@ impl<'a> Executor<'a> {
         let table = Table::new(&c.name, columns)?;
         for col in &table.columns {
             if let Some(expr) = &col.default {
-                eval(expr).map_err(|e| {
+                let default = eval(expr).map_err(|e| {
                     Error::schema(format!(
                         "DEFAULT for column `{}` is not a constant: {e}",
                         col.name
                     ))
+                })?;
+                col.validate(default).map_err(|e| {
+                    Error::schema(format!("DEFAULT for column `{}` is invalid: {e}", col.name))
                 })?;
             }
         }
@@ -382,7 +387,7 @@ impl<'a> Executor<'a> {
             }
         };
 
-        let mut count = 0usize;
+        let mut full_rows = Vec::with_capacity(raw_rows.len());
         for incoming in raw_rows {
             let mut full = vec![Value::Null; table.columns.len()];
             for (idx, col) in table.columns.iter().enumerate() {
@@ -397,8 +402,18 @@ impl<'a> Executor<'a> {
             for (slot, value) in target_indices.iter().zip(incoming.0) {
                 full[*slot] = value;
             }
-            self.engine.insert(&i.table, Row(full))?;
-            count += 1;
+            full_rows.push(Row(full));
+        }
+
+        let existing = self.engine.scan(&i.table)?;
+        let validated = validate_candidate_rows(
+            &table,
+            &existing,
+            full_rows.into_iter().map(|row| (None, row)),
+        )?;
+        let count = validated.len();
+        for (_, row) in validated {
+            self.engine.insert(&i.table, row)?;
         }
         Ok(ResultSet::Insert { count })
     }
@@ -599,16 +614,10 @@ impl<'a> Executor<'a> {
         if !order_by.is_empty() {
             sort_rows_wide(&mut rows, &order_by, schema)?;
         }
-        let offset = limit_eval(&s.offset, "OFFSET")?;
-        let limit = limit_eval(&s.limit, "LIMIT")?;
-
-        // Project each row; if DISTINCT is set, dedupe by total ordering.
-        let mut projected: Vec<Row> = Vec::new();
+        // Project each row; if DISTINCT is set, dedupe before OFFSET/LIMIT.
+        let mut all_projected: Vec<Row> = Vec::new();
         let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
-        for row in rows.into_iter().skip(offset) {
-            if projected.len() >= limit {
-                break;
-            }
+        for row in rows {
             let resolver = WideResolver { schema, row: &row };
             let mut emitted = Vec::with_capacity(plan.len());
             for proj in &plan {
@@ -624,8 +633,11 @@ impl<'a> Executor<'a> {
                     continue;
                 }
             }
-            projected.push(Row(emitted));
+            all_projected.push(Row(emitted));
         }
+        let offset = limit_eval(&s.offset, "OFFSET")?;
+        let limit = limit_eval(&s.limit, "LIMIT")?;
+        let projected = all_projected.into_iter().skip(offset).take(limit).collect();
         Ok(ResultSet::Select {
             columns,
             rows: projected,
@@ -850,19 +862,17 @@ impl<'a> Executor<'a> {
         let offset = limit_eval(&s.offset, "OFFSET")?;
         let limit = limit_eval(&s.limit, "LIMIT")?;
         let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
-        let mut rows: Vec<Row> = Vec::new();
-        for e in emitted.into_iter().skip(offset) {
-            if rows.len() >= limit {
-                break;
-            }
+        let mut distinct_rows: Vec<Row> = Vec::new();
+        for e in emitted {
             if s.distinct {
                 let key = GroupKey(e.row.0.clone());
                 if !seen.insert(key) {
                     continue;
                 }
             }
-            rows.push(e.row);
+            distinct_rows.push(e.row);
         }
+        let rows = distinct_rows.into_iter().skip(offset).take(limit).collect();
         Ok(ResultSet::Select { columns, rows })
     }
 
@@ -961,8 +971,14 @@ impl<'a> Executor<'a> {
             }
             to_update.push((id, new_row));
         }
-        let count = to_update.len();
-        for (id, new) in to_update {
+        let validated = validate_candidate_rows(
+            &table,
+            &self.engine.scan(&u.table)?,
+            to_update.into_iter().map(|(id, row)| (Some(id), row)),
+        )?;
+        let count = validated.len();
+        for (id, new) in validated {
+            let id = id.ok_or_else(|| Error::internal("validated UPDATE row without row id"))?;
             self.engine.update(&u.table, id, new)?;
         }
         Ok(ResultSet::Update { count })
@@ -1469,6 +1485,85 @@ fn limit_eval(expr: &Option<Expression>, label: &str) -> Result<usize> {
             }
         }
     }
+}
+
+fn validate_candidate_rows<I>(
+    table: &Table,
+    existing: &[(RowId, Row)],
+    candidates: I,
+) -> Result<Vec<(Option<RowId>, Row)>>
+where
+    I: IntoIterator<Item = (Option<RowId>, Row)>,
+{
+    let mut validated = Vec::new();
+    for (id, row) in candidates {
+        let row = validate_row_for_table(table, row)?;
+        validate_row_size(table, &row)?;
+        validated.push((id, row));
+    }
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if !col.unique && !col.primary_key {
+            continue;
+        }
+        for (idx, (id, row)) in validated.iter().enumerate() {
+            let candidate = &row.0[col_idx];
+            if candidate.is_null() {
+                continue;
+            }
+            for (existing_id, existing_row) in existing {
+                if Some(*existing_id) == *id {
+                    continue;
+                }
+                if let Some(true) = candidate.equal_sql(&existing_row.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
+            for (_, prior) in validated[..idx].iter() {
+                if let Some(true) = candidate.equal_sql(&prior.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(validated)
+}
+
+fn validate_row_for_table(table: &Table, raw: Row) -> Result<Row> {
+    if raw.len() != table.columns.len() {
+        return Err(Error::ty(format!(
+            "table `{}` expects {} values, got {}",
+            table.name,
+            table.columns.len(),
+            raw.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for (col, v) in table.columns.iter().zip(raw.into_inner()) {
+        out.push(col.validate(v)?);
+    }
+    Ok(Row(out))
+}
+
+fn validate_row_size(table: &Table, row: &Row) -> Result<()> {
+    let mut encoded = Vec::new();
+    encode_row(row, &mut encoded);
+    let max_record = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
+    if encoded.len() > max_record {
+        return Err(Error::value(format!(
+            "row for table `{}` is too large: {} bytes encoded, max {}",
+            table.name,
+            encoded.len(),
+            max_record
+        )));
+    }
+    Ok(())
 }
 
 /// Update per-column type tracking for UNION compatibility. Returns

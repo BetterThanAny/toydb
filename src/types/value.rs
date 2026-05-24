@@ -48,13 +48,19 @@ impl Value {
         Ok(match (self, target) {
             (Value::Null, _) => Value::Null,
             (Value::Boolean(b), DataType::Boolean) => Value::Boolean(*b),
-            (Value::Boolean(b), DataType::Integer) => Value::Integer(if *b { 1 } else { 0 }),
-            (Value::Boolean(b), DataType::Float) => Value::Float(if *b { 1.0 } else { 0.0 }),
+            (Value::Boolean(_), DataType::Integer) => {
+                return Err(Error::ty("cannot convert BOOLEAN to INTEGER"));
+            }
+            (Value::Boolean(_), DataType::Float) => {
+                return Err(Error::ty("cannot convert BOOLEAN to FLOAT"));
+            }
             (Value::Boolean(b), DataType::String) => Value::String(b.to_string()),
             (Value::Integer(n), DataType::Integer) => Value::Integer(*n),
             (Value::Integer(n), DataType::Float) => Value::Float(*n as f64),
             (Value::Integer(n), DataType::String) => Value::String(n.to_string()),
-            (Value::Integer(n), DataType::Boolean) => Value::Boolean(*n != 0),
+            (Value::Integer(_), DataType::Boolean) => {
+                return Err(Error::ty("cannot convert INTEGER to BOOLEAN"));
+            }
             (Value::Float(f), DataType::Float) => Value::Float(*f),
             (Value::Float(f), DataType::Integer) => {
                 if !f.is_finite() {
@@ -62,10 +68,20 @@ impl Value {
                         "cannot convert non-finite float {f} to integer"
                     )));
                 }
+                if f.fract() != 0.0 {
+                    return Err(Error::ty(format!(
+                        "cannot convert non-integral float {f} to INTEGER"
+                    )));
+                }
+                if *f < i64::MIN as f64 || *f > i64::MAX as f64 {
+                    return Err(Error::ty(format!("float {f} is out of range for INTEGER")));
+                }
                 Value::Integer(*f as i64)
             }
             (Value::Float(f), DataType::String) => Value::String(format_float(*f)),
-            (Value::Float(f), DataType::Boolean) => Value::Boolean(*f != 0.0),
+            (Value::Float(_), DataType::Boolean) => {
+                return Err(Error::ty("cannot convert FLOAT to BOOLEAN"));
+            }
             (Value::String(s), DataType::String) => Value::String(s.clone()),
             (Value::String(s), DataType::Integer) => Value::Integer(
                 s.parse()
@@ -251,15 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn coerce_float_to_int_truncates() {
+    fn coerce_float_to_int_requires_integral_value() {
         assert_eq!(
-            Value::Float(3.9).coerce(DataType::Integer).unwrap(),
+            Value::Float(3.0).coerce(DataType::Integer).unwrap(),
             Value::Integer(3)
         );
-        assert_eq!(
-            Value::Float(-3.9).coerce(DataType::Integer).unwrap(),
-            Value::Integer(-3)
-        );
+        assert!(Value::Float(3.9).coerce(DataType::Integer).is_err());
+        assert!(Value::Float(1e20).coerce(DataType::Integer).is_err());
     }
 
     #[test]

@@ -204,28 +204,20 @@ impl Engine for DiskEngine {
         // page and link it as the new head (we prepend to keep insert
         // O(1) when the head has space).
         let mut cur = head;
-        let id = loop {
+        let (id, page_id, page) = loop {
             let mut page = self.pager.read_page(cur)?;
-            if page.free_space() >= buf.len() {
-                let slot = page.insert(&buf)?;
-                self.pager.write_page(cur, page)?;
-                break make_row_id(cur, slot);
+            if let Ok(slot) = page.insert(&buf) {
+                break (make_row_id(cur, slot), cur, page);
             }
             let next = page.next_page();
             if next == 0 {
                 // Allocate a new page and chain it.
                 let new = self.pager.allocate(PageType::TableData)?;
                 let mut new_page = self.pager.read_page(new)?;
-                new_page.set_next_page(0);
                 let slot = new_page.insert(&buf)?;
-                self.pager.write_page(new, new_page)?;
                 // Link it: new.next = head, table_heads[table] = new.
-                let mut new_page = self.pager.read_page(new)?;
                 new_page.set_next_page(head);
-                self.pager.write_page(new, new_page)?;
-                self.table_heads.insert(table.to_string(), new);
-                self.rewrite_catalog()?;
-                break make_row_id(new, slot);
+                break (make_row_id(new, slot), new, new_page);
             }
             cur = next;
         };
@@ -234,6 +226,11 @@ impl Engine for DiskEngine {
             id,
             row: row.clone(),
         })?;
+        self.pager.write_page(page_id, page)?;
+        if page_id != head {
+            self.table_heads.insert(table.to_string(), page_id);
+            self.rewrite_catalog()?;
+        }
         self.pager.flush()?;
         for index in &table_def.indexes {
             let col_idx = table_def.column_index(&index.column)?;
@@ -273,12 +270,12 @@ impl Engine for DiskEngine {
         let mut buf = Vec::new();
         encode_row(&row, &mut buf);
         page.update(slot, &buf)?;
-        self.pager.write_page(page_id, page)?;
         self.wal.append(&LogRecord::Update {
             table: table.to_string(),
             id,
             row: row.clone(),
         })?;
+        self.pager.write_page(page_id, page)?;
         self.pager.flush()?;
         for index in &table_def.indexes {
             let col_idx = table_def.column_index(&index.column)?;
@@ -300,11 +297,11 @@ impl Engine for DiskEngine {
             None => None,
         };
         page.delete(slot)?;
-        self.pager.write_page(page_id, page)?;
         self.wal.append(&LogRecord::Delete {
             table: table.to_string(),
             id,
         })?;
+        self.pager.write_page(page_id, page)?;
         self.pager.flush()?;
         if let Some(old_row) = old_row {
             for index in &table_def.indexes {
@@ -618,6 +615,7 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 let (page_id, expected_slot) = split_row_id(*id);
                 let mut buf = Vec::new();
                 encode_row(row, &mut buf);
+                ensure_replay_page_in_chain(pager, &mut heads, table, page_id)?;
                 let mut page = pager.read_page(page_id)?;
                 // Idempotent replay: this record has already been applied
                 // if the slot already holds the same bytes (the common
@@ -690,6 +688,45 @@ fn has_later_record_for_row(recs: &[LogRecord], idx: usize, table: &str, id: Row
         LogRecord::DropTable(name) => name == table,
         LogRecord::CreateTable(_) | LogRecord::CreateIndex(_) | LogRecord::DropIndex(_) => false,
     })
+}
+
+fn ensure_replay_page_in_chain(
+    pager: &mut Pager,
+    heads: &mut std::collections::HashMap<String, PageId>,
+    table: &str,
+    page_id: PageId,
+) -> Result<()> {
+    if page_in_chain(pager, heads, table, page_id)? {
+        pager.ensure_page_id(page_id, PageType::TableData, false)?;
+        return Ok(());
+    }
+    pager.ensure_page_id(page_id, PageType::TableData, true)?;
+    let old_head = *heads
+        .get(table)
+        .ok_or_else(|| Error::internal(format!("replay: missing head for `{table}`")))?;
+    let mut page = pager.read_page(page_id)?;
+    page.set_next_page(old_head);
+    pager.write_page(page_id, page)?;
+    heads.insert(table.to_string(), page_id);
+    Ok(())
+}
+
+fn page_in_chain(
+    pager: &mut Pager,
+    heads: &std::collections::HashMap<String, PageId>,
+    table: &str,
+    page_id: PageId,
+) -> Result<bool> {
+    let mut cur = *heads
+        .get(table)
+        .ok_or_else(|| Error::internal(format!("replay: missing head for `{table}`")))?;
+    while cur != 0 {
+        if cur == page_id {
+            return Ok(true);
+        }
+        cur = pager.read_page(cur)?.next_page();
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

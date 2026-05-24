@@ -42,8 +42,23 @@ impl Parser {
     pub fn parse_all(input: &str) -> Result<Vec<Statement>> {
         let mut p = Self::new(input)?;
         let mut out = Vec::new();
-        while let Some(s) = p.parse_statement()? {
-            out.push(s);
+        loop {
+            while matches!(p.peek_tok(), Some(Token::Semicolon)) {
+                p.bump();
+            }
+            if p.peek_tok().is_none() {
+                break;
+            }
+            out.push(p.parse_statement_inner()?);
+            if matches!(p.peek_tok(), Some(Token::Semicolon)) {
+                p.bump();
+            } else if let Some(extra) = p.peek().cloned() {
+                return Err(Error::parse(
+                    extra.line,
+                    extra.col,
+                    format!("expected semicolon before {}", extra.token.as_str()),
+                ));
+            }
         }
         Ok(out)
     }
@@ -1573,6 +1588,12 @@ mod tests {
     fn parse_all_multi_statement() {
         let v = Parser::parse_all("SELECT 1; SELECT 2; SELECT 3").unwrap();
         assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn parse_all_requires_statement_separator() {
+        let e = Parser::parse_all("SELECT 1 SELECT 2").unwrap_err();
+        assert!(e.to_string().contains("expected semicolon"), "{e}");
     }
 
     #[test]

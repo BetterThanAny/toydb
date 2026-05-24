@@ -94,6 +94,7 @@ impl Pager {
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.read_exact(&mut buf)?;
         let page = Page::from_bytes(buf);
+        page.validate()?;
         self.cache.insert(
             id,
             CacheEntry {
@@ -138,6 +139,51 @@ impl Pager {
         Ok(id)
     }
 
+    /// Ensure that `id` exists for WAL replay. If `reset` is true, the page
+    /// is reinitialised to `kind` after being removed from the free list.
+    pub fn ensure_page_id(&mut self, id: PageId, kind: PageType, reset: bool) -> Result<()> {
+        if id == SUPER_PAGE {
+            return Err(Error::other("cannot prepare super page for replay"));
+        }
+        if id >= self.page_count {
+            let old_count = self.page_count;
+            self.page_count = id + 1;
+            self.file.set_len(self.page_count * PAGE_SIZE as u64)?;
+            self.write_super()?;
+            for page_id in old_count..=id {
+                let page_type = if page_id == id { kind } else { PageType::Free };
+                self.cache.insert(
+                    page_id,
+                    CacheEntry {
+                        page: Page::new(page_type),
+                        dirty: true,
+                    },
+                );
+            }
+            return Ok(());
+        }
+
+        let page = self.read_page(id)?;
+        let page_type = page.page_type()?;
+        if page_type == PageType::Free {
+            self.remove_from_free_list(id)?;
+        }
+        if reset || page_type == PageType::Free {
+            self.cache.insert(
+                id,
+                CacheEntry {
+                    page: Page::new(kind),
+                    dirty: true,
+                },
+            );
+        } else if page_type != kind {
+            return Err(Error::other(format!(
+                "page {id} has type {page_type:?}, expected {kind:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Add a page to the free list. Future `allocate` calls reuse it.
     pub fn deallocate(&mut self, id: PageId) -> Result<()> {
         if id == 0 {
@@ -154,6 +200,29 @@ impl Pager {
         );
         self.free_head = id;
         self.write_super()?;
+        Ok(())
+    }
+
+    fn remove_from_free_list(&mut self, id: PageId) -> Result<()> {
+        let mut cur = self.free_head;
+        let mut prev = 0;
+        while cur != 0 {
+            let page = self.read_page(cur)?;
+            let next = page.next_page();
+            if cur == id {
+                if prev == 0 {
+                    self.free_head = next;
+                } else {
+                    let mut prev_page = self.read_page(prev)?;
+                    prev_page.set_next_page(next);
+                    self.write_page(prev, prev_page)?;
+                }
+                self.write_super()?;
+                return Ok(());
+            }
+            prev = cur;
+            cur = next;
+        }
         Ok(())
     }
 
