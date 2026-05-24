@@ -11,6 +11,7 @@
 //! Every mutation goes through the WAL first, so a crash mid-statement
 //! is recoverable: replay restores rows + catalog state on the next open.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{Catalog, Index, Table};
@@ -92,8 +93,12 @@ impl DiskEngine {
 impl Drop for DiskEngine {
     fn drop(&mut self) {
         // Best effort — Drop swallows errors. The next open() will redo
-        // any pending WAL anyway, so we don't lose anything.
-        let _ = self.pager.flush();
+        // any pending WAL anyway, so we don't lose anything. If flushing
+        // succeeds, truncate the WAL so clean exits do not accumulate replay
+        // work forever.
+        if self.pager.flush().is_ok() {
+            let _ = self.wal.truncate();
+        }
     }
 }
 
@@ -105,6 +110,8 @@ impl Engine for DiskEngine {
                 table.name
             )));
         }
+        let mut encoded_check = Vec::new();
+        encode_table(&table, &mut encoded_check)?;
         // Allocate first data page for the table.
         let head = self.pager.allocate(PageType::TableData)?;
         self.wal.append(&LogRecord::CreateTable(table.clone()))?;
@@ -244,6 +251,14 @@ impl Engine for DiskEngine {
         scan_table_pages(&mut self.pager, &self.table_heads, table)
     }
 
+    fn preflight_update_batch(&mut self, table: &str, updates: &[(RowId, Row)]) -> Result<()> {
+        let table_def = self.catalog.get(table)?.clone();
+        let validated = validate_update_rows(&table_def, updates)?;
+        check_unique_updates_disk(&mut self.pager, &self.table_heads, &table_def, &validated)?;
+        preflight_update_pages(&mut self.pager, &validated)?;
+        Ok(())
+    }
+
     fn update(&mut self, table: &str, id: RowId, row: Row) -> Result<()> {
         let table_def = self.catalog.get(table)?.clone();
         let row = validate_row(&table_def, row)?;
@@ -254,33 +269,16 @@ impl Engine for DiskEngine {
             &row,
             Some(id),
         )?;
-        let (page_id, slot) = split_row_id(id);
-        let mut page = self.pager.read_page(page_id)?;
-        let old_row = match page.get(slot) {
-            Some(bytes) => {
-                let mut s = bytes;
-                decode_row(&mut s)?
-            }
-            None => {
-                return Err(Error::internal(format!(
-                    "update target row {id} no longer exists"
-                )));
-            }
-        };
-        let mut buf = Vec::new();
-        encode_row(&row, &mut buf);
-        page.update(slot, &buf)?;
-        self.wal.append(&LogRecord::Update {
-            table: table.to_string(),
-            id,
-            row: row.clone(),
-        })?;
-        self.pager.write_page(page_id, page)?;
-        self.pager.flush()?;
-        for index in &table_def.indexes {
-            let col_idx = table_def.column_index(&index.column)?;
-            self.indexes.remove(&index.name, &old_row.0[col_idx], id);
-            self.indexes.insert(&index.name, &row.0[col_idx], id);
+        self.update_unchecked(table, &table_def, id, row)
+    }
+
+    fn update_batch(&mut self, table: &str, updates: &[(RowId, Row)]) -> Result<()> {
+        let table_def = self.catalog.get(table)?.clone();
+        let validated = validate_update_rows(&table_def, updates)?;
+        check_unique_updates_disk(&mut self.pager, &self.table_heads, &table_def, &validated)?;
+        preflight_update_pages(&mut self.pager, &validated)?;
+        for (id, row) in validated {
+            self.update_unchecked(table, &table_def, id, row)?;
         }
         Ok(())
     }
@@ -351,6 +349,46 @@ impl Engine for DiskEngine {
     }
 }
 
+impl DiskEngine {
+    fn update_unchecked(
+        &mut self,
+        table: &str,
+        table_def: &Table,
+        id: RowId,
+        row: Row,
+    ) -> Result<()> {
+        let (page_id, slot) = split_row_id(id);
+        let mut page = self.pager.read_page(page_id)?;
+        let old_row = match page.get(slot) {
+            Some(bytes) => {
+                let mut s = bytes;
+                decode_row(&mut s)?
+            }
+            None => {
+                return Err(Error::internal(format!(
+                    "update target row {id} no longer exists"
+                )));
+            }
+        };
+        let mut buf = Vec::new();
+        encode_row(&row, &mut buf);
+        page.update(slot, &buf)?;
+        self.wal.append(&LogRecord::Update {
+            table: table.to_string(),
+            id,
+            row: row.clone(),
+        })?;
+        self.pager.write_page(page_id, page)?;
+        self.pager.flush()?;
+        for index in &table_def.indexes {
+            let col_idx = table_def.column_index(&index.column)?;
+            self.indexes.remove(&index.name, &old_row.0[col_idx], id);
+            self.indexes.insert(&index.name, &row.0[col_idx], id);
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
@@ -379,6 +417,50 @@ fn validate_row(t: &Table, raw: Row) -> Result<Row> {
         out.push(col.validate(v)?);
     }
     Ok(Row(out))
+}
+
+fn validate_update_rows(table: &Table, updates: &[(RowId, Row)]) -> Result<Vec<(RowId, Row)>> {
+    let mut seen_targets = HashSet::new();
+    let mut validated = Vec::with_capacity(updates.len());
+    for (id, row) in updates {
+        if !seen_targets.insert(*id) {
+            return Err(Error::internal(format!("duplicate update target row {id}")));
+        }
+        let row = validate_row(table, row.clone())?;
+        validate_row_size(table, &row)?;
+        validated.push((*id, row));
+    }
+    Ok(validated)
+}
+
+fn validate_row_size(table: &Table, row: &Row) -> Result<()> {
+    let mut encoded = Vec::new();
+    encode_row(row, &mut encoded);
+    if encoded.len() > crate::storage::page::PAGE_SIZE - crate::storage::page::HEADER_SIZE {
+        return Err(Error::other(format!(
+            "row for table `{}` is too large for a page: {} bytes",
+            table.name,
+            encoded.len()
+        )));
+    }
+    Ok(())
+}
+
+fn preflight_update_pages(pager: &mut Pager, updates: &[(RowId, Row)]) -> Result<()> {
+    let mut pages = HashMap::new();
+    for (id, row) in updates {
+        let (page_id, slot) = split_row_id(*id);
+        let page = match pages.entry(page_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(pager.read_page(page_id)?)
+            }
+        };
+        let mut buf = Vec::new();
+        encode_row(row, &mut buf);
+        page.update(slot, &buf)?;
+    }
+    Ok(())
 }
 
 fn check_unique_disk(
@@ -417,6 +499,57 @@ fn check_unique_disk(
                 }
             }
             cur = page.next_page();
+        }
+    }
+    Ok(())
+}
+
+fn check_unique_updates_disk(
+    pager: &mut Pager,
+    heads: &HashMap<String, PageId>,
+    table: &Table,
+    updates: &[(RowId, Row)],
+) -> Result<()> {
+    let head = *heads
+        .get(&table.name)
+        .ok_or_else(|| Error::internal(format!("missing head for `{}`", table.name)))?;
+    let updating_ids: HashSet<RowId> = updates.iter().map(|(id, _)| *id).collect();
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if !col.unique && !col.primary_key {
+            continue;
+        }
+        for (idx, (_id, row)) in updates.iter().enumerate() {
+            let candidate = &row.0[col_idx];
+            if candidate.is_null() {
+                continue;
+            }
+            let mut cur = head;
+            while cur != 0 {
+                let page = pager.read_page(cur)?;
+                for (slot, bytes) in page.iter() {
+                    let existing_id = make_row_id(cur, slot);
+                    if updating_ids.contains(&existing_id) {
+                        continue;
+                    }
+                    let mut s = bytes;
+                    let existing_row = decode_row(&mut s)?;
+                    if let Some(true) = candidate.equal_sql(&existing_row.0[col_idx])? {
+                        return Err(Error::constraint(format!(
+                            "duplicate value for unique column `{}`: {}",
+                            col.name, candidate
+                        )));
+                    }
+                }
+                cur = page.next_page();
+            }
+            for (_, prior) in &updates[..idx] {
+                if let Some(true) = candidate.equal_sql(&prior.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -503,55 +636,76 @@ fn write_catalog(
     catalog: &Catalog,
     heads: &std::collections::HashMap<String, PageId>,
 ) -> Result<()> {
-    // Free old catalog chain.
-    let mut cur = pager.catalog_root();
-    while cur != 0 {
-        let p = pager.read_page(cur)?;
-        let next = p.next_page();
-        pager.deallocate(cur)?;
-        cur = next;
-    }
-    pager.set_catalog_root(0)?;
+    // Start from a stable page cache before writing the replacement catalog
+    // chain. This keeps unrelated dirty data pages out of the root-switch
+    // flushes below.
+    pager.flush()?;
+    let old_root = pager.catalog_root();
+    let new_root = build_catalog_chain(pager, catalog, heads)?;
+
+    // Make the new catalog pages durable before publishing the new root.
+    pager.flush()?;
+    pager.set_catalog_root(new_root)?;
+    pager.flush()?;
+
+    // The old chain is no longer reachable. Free it after the root switch;
+    // a crash before this point can at worst leak pages, not lose catalog.
+    free_catalog_chain(pager, old_root)?;
+    pager.flush()?;
+    Ok(())
+}
+
+fn build_catalog_chain(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    heads: &std::collections::HashMap<String, PageId>,
+) -> Result<PageId> {
     if catalog.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    // Build new chain.
+
     let mut head_id: PageId = 0;
+    let mut current: Option<(PageId, crate::storage::page::Page)> = None;
     for (name, table) in catalog.iter() {
         let head_data = *heads
             .get(name)
             .ok_or_else(|| Error::internal(format!("no head for `{name}`")))?;
         let mut entry = Vec::new();
         entry.extend_from_slice(&head_data.to_le_bytes());
-        encode_table(table, &mut entry);
-        // Try to fit in the head page; else allocate a new page and prepend.
-        if head_id == 0 {
-            let new = pager.allocate(PageType::Catalog)?;
-            let mut np = pager.read_page(new)?;
-            np.set_next_page(0);
-            np.insert(&entry)?;
-            pager.write_page(new, np)?;
-            head_id = new;
-            pager.set_catalog_root(head_id)?;
-        } else {
-            let mut placed = false;
-            // Try existing head first.
-            let mut hp = pager.read_page(head_id)?;
-            if hp.free_space() >= entry.len() {
-                hp.insert(&entry)?;
-                pager.write_page(head_id, hp)?;
-                placed = true;
+        encode_table(table, &mut entry)?;
+
+        match current.as_mut() {
+            Some((_id, page)) if page.free_space() >= entry.len() => {
+                page.insert(&entry)?;
             }
-            if !placed {
+            _ => {
+                if let Some((id, page)) = current.take() {
+                    pager.write_page(id, page)?;
+                }
+                // Prepend a fresh catalog page. We deliberately do not free
+                // the old catalog chain until after the new root is durable.
                 let new = pager.allocate(PageType::Catalog)?;
                 let mut np = pager.read_page(new)?;
                 np.set_next_page(head_id);
                 np.insert(&entry)?;
-                pager.write_page(new, np)?;
                 head_id = new;
-                pager.set_catalog_root(head_id)?;
+                current = Some((new, np));
             }
         }
+    }
+    if let Some((id, page)) = current.take() {
+        pager.write_page(id, page)?;
+    }
+    Ok(head_id)
+}
+
+fn free_catalog_chain(pager: &mut Pager, root: PageId) -> Result<()> {
+    let mut cur = root;
+    while cur != 0 {
+        let p = pager.read_page(cur)?;
+        let next = p.next_page();
+        pager.deallocate(cur)?;
+        cur = next;
     }
     Ok(())
 }
@@ -588,6 +742,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 let mut cur = head;
                 while cur != 0 {
                     let page = pager.read_page(cur)?;
+                    if page.page_type()? == PageType::Free {
+                        break;
+                    }
                     let next = page.next_page();
                     pager.deallocate(cur)?;
                     cur = next;
@@ -700,6 +857,11 @@ fn ensure_replay_page_in_chain(
         pager.ensure_page_id(page_id, PageType::TableData, false)?;
         return Ok(());
     }
+    if page_belongs_to_known_chain(pager, heads, page_id)? {
+        return Err(Error::other(format!(
+            "replay insert for `{table}` targets page {page_id}, already reachable from another chain"
+        )));
+    }
     pager.ensure_page_id(page_id, PageType::TableData, true)?;
     let old_head = *heads
         .get(table)
@@ -720,9 +882,55 @@ fn page_in_chain(
     let mut cur = *heads
         .get(table)
         .ok_or_else(|| Error::internal(format!("replay: missing head for `{table}`")))?;
+    let mut seen = HashSet::new();
     while cur != 0 {
         if cur == page_id {
             return Ok(true);
+        }
+        if !seen.insert(cur) {
+            return Err(Error::other(format!(
+                "page chain for `{table}` contains a cycle at page {cur}"
+            )));
+        }
+        cur = pager.read_page(cur)?.next_page();
+    }
+    Ok(false)
+}
+
+fn page_belongs_to_known_chain(
+    pager: &mut Pager,
+    heads: &HashMap<String, PageId>,
+    page_id: PageId,
+) -> Result<bool> {
+    if page_id == 0 {
+        return Ok(true);
+    }
+    if chain_contains_page(pager, pager.catalog_root(), page_id, "catalog")? {
+        return Ok(true);
+    }
+    for (table, head) in heads {
+        if chain_contains_page(pager, *head, page_id, table)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn chain_contains_page(
+    pager: &mut Pager,
+    mut cur: PageId,
+    page_id: PageId,
+    label: &str,
+) -> Result<bool> {
+    let mut seen = HashSet::new();
+    while cur != 0 {
+        if cur == page_id {
+            return Ok(true);
+        }
+        if !seen.insert(cur) {
+            return Err(Error::other(format!(
+                "page chain `{label}` contains a cycle at page {cur}"
+            )));
         }
         cur = pager.read_page(cur)?.next_page();
     }
@@ -902,9 +1110,9 @@ mod tests {
                 Row(vec![Value::Integer(2), Value::String("b".into())]),
             )
             .unwrap();
-            // Note: no explicit checkpoint. Drop runs flush via Drop impl,
-            // but the WAL still contains the records — replay should be a
-            // no-op here because we already flushed pages through `insert`.
+            // Simulate a process crash: keep the WAL instead of letting Drop
+            // perform its clean-exit checkpoint.
+            std::mem::forget(e);
         }
         {
             let mut e = DiskEngine::open(&path).unwrap();

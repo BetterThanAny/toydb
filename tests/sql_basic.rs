@@ -137,6 +137,32 @@ fn update_is_atomic_on_constraint_failure() {
 }
 
 #[test]
+fn update_can_swap_unique_values() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE u (id INT PRIMARY KEY, v INT UNIQUE);
+        INSERT INTO u VALUES (1, 100), (2, 200);
+    ",
+    );
+
+    run_all(
+        &mut e,
+        "UPDATE u SET v = CASE WHEN v = 100 THEN 200 ELSE 100 END",
+    );
+
+    let r = run(&mut e, "SELECT id, v FROM u ORDER BY id");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows[0][1], Value::Integer(200));
+            assert_eq!(rows[1][1], Value::Integer(100));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn duplicate_insert_columns_are_rejected() {
     let mut e = MemoryEngine::new();
     run_all(&mut e, "CREATE TABLE t (a INT, b INT)");
@@ -358,6 +384,82 @@ fn case_insensitive_keywords_case_sensitive_ids() {
     // lowercase `users` should error
     let stmt = Parser::parse_one("SELECT * FROM users").unwrap();
     assert!(Executor::new(&mut e).execute(&stmt).is_err());
+}
+
+#[test]
+fn mixed_union_and_union_all_is_left_associative() {
+    let mut e = MemoryEngine::new();
+    let r = run(&mut e, "SELECT 1 AS x UNION SELECT 1 UNION ALL SELECT 1");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::Integer(1));
+            assert_eq!(rows[1][0], Value::Integer(1));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn group_by_can_order_by_aggregate_not_in_select() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (a INT, b INT);
+        INSERT INTO t VALUES (1, 10), (1, 20), (2, 5);
+    ",
+    );
+    let r = run(
+        &mut e,
+        "SELECT a FROM t GROUP BY a ORDER BY COUNT(*) DESC, a",
+    );
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::Integer(1));
+            assert_eq!(rows[1][0], Value::Integer(2));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn group_by_can_having_on_select_alias() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (g INT, v INT);
+        INSERT INTO t VALUES (1, 10), (1, 20), (2, 5);
+    ",
+    );
+    let r = run(
+        &mut e,
+        "SELECT g, SUM(v) AS s FROM t GROUP BY g HAVING s > 15 ORDER BY g",
+    );
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(1));
+            assert_eq!(rows[0][1], Value::Integer(30));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn self_join_without_unique_alias_is_rejected() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT);
+        INSERT INTO t VALUES (1), (2);
+    ",
+    );
+    let err = try_run(&mut e, "SELECT * FROM t JOIN t ON t.id = t.id").unwrap_err();
+    assert!(err.contains("duplicate table alias"), "{err}");
 }
 
 #[test]

@@ -24,13 +24,17 @@ fn tmpdb() -> PathBuf {
 
 fn cleanup(p: &std::path::Path) {
     std::fs::remove_file(p).ok();
+    std::fs::remove_file(wal_path(p)).ok();
+}
+
+fn wal_path(p: &std::path::Path) -> PathBuf {
     let mut wal = p.to_path_buf();
     let stem = p
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     wal.set_file_name(format!("{stem}-wal"));
-    std::fs::remove_file(&wal).ok();
+    wal
 }
 
 fn run_all(engine: &mut DiskEngine, sql: &str) {
@@ -173,8 +177,9 @@ fn wal_replay_survives_delete_insert_slot_reuse() {
             INSERT INTO t VALUES (2, 'new');
         ",
         );
-        // No checkpoint: reopen must replay a WAL containing insert/delete/insert
-        // records for the same physical slot.
+        // Simulate a process crash: reopen must replay a WAL containing
+        // insert/delete/insert records for the same physical slot.
+        std::mem::forget(e);
     }
     {
         let mut e = DiskEngine::open(&path).unwrap();
@@ -216,6 +221,35 @@ fn unique_constraint_persists() {
 }
 
 #[test]
+fn disk_update_can_swap_unique_values_and_persist() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE u (id INT PRIMARY KEY, v INT UNIQUE);
+            INSERT INTO u VALUES (1, 100), (2, 200);
+            UPDATE u SET v = CASE WHEN v = 100 THEN 200 ELSE 100 END;
+        ",
+        );
+        e.checkpoint().unwrap();
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT id, v FROM u ORDER BY id");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows[0][1], Value::Integer(200));
+                assert_eq!(rows[1][1], Value::Integer(100));
+            }
+            _ => panic!(),
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
 fn disk_multi_value_insert_failure_is_atomic() {
     let path = tmpdb();
     {
@@ -242,6 +276,114 @@ fn disk_multi_value_insert_failure_is_atomic() {
             _ => panic!(),
         }
     }
+    cleanup(&path);
+}
+
+#[test]
+fn disk_update_page_capacity_failure_is_atomic() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let mut setup =
+            String::from("CREATE TABLE t (id INT PRIMARY KEY, s TEXT); INSERT INTO t VALUES ");
+        for i in 1..=40 {
+            if i > 1 {
+                setup.push(',');
+            }
+            setup.push_str(&format!("({i}, REPEAT('a', 200))"));
+        }
+        setup.push(';');
+        run_all(&mut e, &setup);
+
+        let err = try_run(
+            &mut e,
+            "UPDATE t SET s = REPEAT('x', 7000) WHERE id = 37 OR id = 1",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("reallocation") || err.contains("page full"),
+            "{err}"
+        );
+
+        let r = run(
+            &mut e,
+            "SELECT id, LENGTH(s) FROM t WHERE id = 1 OR id = 37 ORDER BY id",
+        );
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Integer(1));
+                assert_eq!(rows[0][1], Value::Integer(200));
+                assert_eq!(rows[1][0], Value::Integer(37));
+                assert_eq!(rows[1][1], Value::Integer(200));
+            }
+            _ => panic!(),
+        }
+        e.checkpoint().unwrap();
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn disk_expression_default_survives_reopen() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (id INT PRIMARY KEY, x INT DEFAULT 1 + 1);
+            INSERT INTO t (id) VALUES (1);
+        ",
+        );
+        e.checkpoint().unwrap();
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(&mut e, "INSERT INTO t (id) VALUES (2)");
+        let r = run(&mut e, "SELECT id, x FROM t ORDER BY id");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows[0][1], Value::Integer(2));
+                assert_eq!(rows[1][1], Value::Integer(2));
+            }
+            _ => panic!(),
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn wal_replay_ignores_and_truncates_torn_tail_after_valid_records() {
+    use std::io::Write;
+
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(&mut e, "CREATE TABLE t (id INT PRIMARY KEY)");
+        // Simulate a process crash: keep a valid WAL record before the
+        // torn tail below.
+        std::mem::forget(e);
+    }
+
+    {
+        let mut wal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(wal_path(&path))
+            .unwrap();
+        wal.write_all(&10u32.to_le_bytes()).unwrap();
+        wal.write_all(&[3]).unwrap();
+        wal.sync_data().unwrap();
+    }
+
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT COUNT(*) FROM t");
+        match r {
+            ResultSet::Select { rows, .. } => assert_eq!(rows[0][0], Value::Integer(0)),
+            _ => panic!(),
+        }
+    }
+    assert_eq!(std::fs::metadata(wal_path(&path)).unwrap().len(), 0);
     cleanup(&path);
 }
 

@@ -4,7 +4,7 @@
 //! ordered by insertion (`RowId` is monotonically allocated). Primary
 //! key and unique constraints are enforced on insert/update.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::catalog::{Catalog, Index, Table};
 use crate::engine::index::IndexStore;
@@ -190,6 +190,48 @@ impl Engine for MemoryEngine {
         Ok(())
     }
 
+    fn update_batch(&mut self, table: &str, updates: &[(RowId, Row)]) -> Result<()> {
+        let table_def = self.catalog.get(table)?.clone();
+        let store = self
+            .data
+            .get(table)
+            .ok_or_else(|| Error::internal("missing data storage"))?;
+        let mut seen_targets = HashSet::new();
+        let mut validated = Vec::with_capacity(updates.len());
+        for (id, row) in updates {
+            if !store.contains_key(id) {
+                return Err(Error::internal(format!(
+                    "update target row {id} no longer exists"
+                )));
+            }
+            if !seen_targets.insert(*id) {
+                return Err(Error::internal(format!("duplicate update target row {id}")));
+            }
+            validated.push((*id, self.validate_row(&table_def, row.clone())?));
+        }
+        check_unique_updates(&table_def, store, &validated)?;
+
+        let store = self
+            .data
+            .get_mut(table)
+            .ok_or_else(|| Error::internal("missing data storage"))?;
+        let mut old_rows = Vec::with_capacity(validated.len());
+        for (id, row) in &validated {
+            let old = store.insert(*id, row.clone()).ok_or_else(|| {
+                Error::internal(format!("update target row {id} no longer exists"))
+            })?;
+            old_rows.push((*id, old));
+        }
+        for index in &table_def.indexes {
+            let col_idx = table_def.column_index(&index.column)?;
+            for ((id, row), (_, old_row)) in validated.iter().zip(old_rows.iter()) {
+                self.indexes.remove(&index.name, &old_row.0[col_idx], *id);
+                self.indexes.insert(&index.name, &row.0[col_idx], *id);
+            }
+        }
+        Ok(())
+    }
+
     fn delete(&mut self, table: &str, id: RowId) -> Result<()> {
         let table_def = self.catalog.get(table)?.clone();
         let store = self
@@ -331,6 +373,45 @@ impl Engine for MemoryEngine {
         }
         Ok(())
     }
+}
+
+fn check_unique_updates(
+    table: &Table,
+    existing: &BTreeMap<RowId, Row>,
+    updates: &[(RowId, Row)],
+) -> Result<()> {
+    let updating_ids: HashSet<RowId> = updates.iter().map(|(id, _)| *id).collect();
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if !col.unique && !col.primary_key {
+            continue;
+        }
+        for (idx, (_id, row)) in updates.iter().enumerate() {
+            let candidate = &row.0[col_idx];
+            if candidate.is_null() {
+                continue;
+            }
+            for (existing_id, existing_row) in existing {
+                if updating_ids.contains(existing_id) {
+                    continue;
+                }
+                if let Some(true) = candidate.equal_sql(&existing_row.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
+            for (_, prior) in &updates[..idx] {
+                if let Some(true) = candidate.equal_sql(&prior.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

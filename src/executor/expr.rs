@@ -441,7 +441,7 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
         .map(|a| eval_with(a, r))
         .collect::<Result<_>>()?;
     match upper.as_str() {
-        "ABS" => unary_numeric(&evaled, |x| x.abs(), |x: i64| x.wrapping_abs()),
+        "ABS" => abs_numeric(&evaled),
         "ROUND" => unary_float(&evaled, f64::round),
         "FLOOR" => unary_float(&evaled, f64::floor),
         "CEILING" | "CEIL" => unary_float(&evaled, f64::ceil),
@@ -567,12 +567,15 @@ fn check_arity(name: &str, want: usize, vs: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn unary_numeric(vs: &[Value], f: impl Fn(f64) -> f64, g: impl Fn(i64) -> i64) -> Result<Value> {
-    check_arity("function", 1, vs)?;
+fn abs_numeric(vs: &[Value]) -> Result<Value> {
+    check_arity("ABS", 1, vs)?;
     Ok(match &vs[0] {
         Value::Null => Value::Null,
-        Value::Integer(n) => Value::Integer(g(*n)),
-        Value::Float(x) => Value::Float(f(*x)),
+        Value::Integer(n) => Value::Integer(
+            n.checked_abs()
+                .ok_or_else(|| Error::value("integer abs overflow"))?,
+        ),
+        Value::Float(x) => Value::Float(x.abs()),
         other => {
             return Err(Error::ty(format!(
                 "expected numeric, got {}",
@@ -638,7 +641,7 @@ fn substring(vs: &[Value]) -> Result<Value> {
     // SQL is 1-based.
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
-    let start_idx = (start - 1).max(0).min(len) as usize;
+    let start_idx = start.saturating_sub(1).max(0).min(len) as usize;
     let end_idx = if vs.len() == 3 {
         let take = match &vs[2] {
             Value::Null => return Ok(Value::Null),
@@ -650,7 +653,8 @@ fn substring(vs: &[Value]) -> Result<Value> {
                 )));
             }
         };
-        (start_idx + take.max(0) as usize).min(chars.len())
+        let take = take.max(0) as usize;
+        start_idx.saturating_add(take).min(chars.len())
     } else {
         chars.len()
     };
@@ -674,38 +678,23 @@ pub(crate) fn like_match_for_test(haystack: &str, pattern: &str) -> bool {
 fn like_match(haystack: &str, pattern: &str) -> bool {
     let h: Vec<char> = haystack.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
-    like_inner(&h, 0, &p, 0)
-}
-
-fn like_inner(h: &[char], hi: usize, p: &[char], pi: usize) -> bool {
-    if pi == p.len() {
-        return hi == h.len();
-    }
-    match p[pi] {
-        '%' => {
-            // Try to match zero or more characters.
-            for end in hi..=h.len() {
-                if like_inner(h, end, p, pi + 1) {
-                    return true;
-                }
-            }
-            false
-        }
-        '_' => {
-            if hi >= h.len() {
-                false
-            } else {
-                like_inner(h, hi + 1, p, pi + 1)
-            }
-        }
-        c => {
-            if hi < h.len() && h[hi] == c {
-                like_inner(h, hi + 1, p, pi + 1)
-            } else {
-                false
-            }
+    let mut dp = vec![vec![false; p.len() + 1]; h.len() + 1];
+    dp[0][0] = true;
+    for j in 1..=p.len() {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
         }
     }
+    for i in 1..=h.len() {
+        for j in 1..=p.len() {
+            dp[i][j] = match p[j - 1] {
+                '%' => dp[i][j - 1] || dp[i - 1][j],
+                '_' => dp[i - 1][j - 1],
+                c => h[i - 1] == c && dp[i - 1][j - 1],
+            };
+        }
+    }
+    dp[h.len()][p.len()]
 }
 
 // ---------------------------------------------------------------------
@@ -826,6 +815,10 @@ mod tests {
         // 1-based, beyond bounds
         assert_eq!(ev("SUBSTRING('abc', 1, 100)"), Value::String("abc".into()));
         assert_eq!(ev("SUBSTRING('abc', 5)"), Value::String("".into()));
+        assert_eq!(
+            ev("SUBSTRING('abc', 2, 9223372036854775807)"),
+            Value::String("bc".into())
+        );
     }
 
     #[test]
@@ -869,6 +862,10 @@ mod tests {
         assert_eq!(ev("'hello' LIKE 'h_llo'"), Value::Boolean(true));
         assert_eq!(ev("'hello' LIKE 'world'"), Value::Boolean(false));
         assert_eq!(ev("'abc' NOT LIKE 'a%'"), Value::Boolean(false));
+        assert_eq!(
+            ev("'aaaaaaaaab' LIKE '%a%a%a%a%a%a%a%a%b'"),
+            Value::Boolean(true)
+        );
     }
 
     #[test]
@@ -883,6 +880,7 @@ mod tests {
     fn abs_function() {
         assert_eq!(ev("ABS(-5)"), Value::Integer(5));
         assert_eq!(ev("ABS(-5.5)"), Value::Float(5.5));
+        assert!(ev_err("ABS(-9223372036854775807 - 1)").contains("overflow"));
     }
 
     #[test]

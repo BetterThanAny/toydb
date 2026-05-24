@@ -8,9 +8,9 @@
 //! either pipeline picks it up.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::catalog::{Index, Table};
+use crate::catalog::{Column, Index, Table};
 use crate::engine::{Engine, RowId};
 use crate::error::{Error, Result};
 use crate::executor::aggregate::{
@@ -256,21 +256,11 @@ impl<'a> Executor<'a> {
             }
             return Err(Error::schema(format!("table `{}` already exists", c.name)));
         }
-        let columns: Vec<crate::catalog::Column> = c.columns.iter().map(Into::into).collect();
-        let table = Table::new(&c.name, columns)?;
-        for col in &table.columns {
-            if let Some(expr) = &col.default {
-                let default = eval(expr).map_err(|e| {
-                    Error::schema(format!(
-                        "DEFAULT for column `{}` is not a constant: {e}",
-                        col.name
-                    ))
-                })?;
-                col.validate(default).map_err(|e| {
-                    Error::schema(format!("DEFAULT for column `{}` is invalid: {e}", col.name))
-                })?;
-            }
+        let mut columns: Vec<Column> = c.columns.iter().map(Into::into).collect();
+        for col in &mut columns {
+            fold_column_default(col)?;
         }
+        let table = Table::new(&c.name, columns)?;
         self.engine.create_table(table)?;
         Ok(ResultSet::CreateTable {
             name: c.name.clone(),
@@ -280,16 +270,8 @@ impl<'a> Executor<'a> {
     fn exec_alter_table(&mut self, a: &AlterTableStmt) -> Result<ResultSet> {
         match &a.action {
             AlterAction::AddColumn(def) => {
-                // Validate constant default at create time.
-                if let Some(d) = &def.default {
-                    eval(d).map_err(|e| {
-                        Error::schema(format!(
-                            "DEFAULT for column `{}` is not constant: {e}",
-                            def.name
-                        ))
-                    })?;
-                }
-                let col: crate::catalog::Column = def.into();
+                let mut col: Column = def.into();
+                fold_column_default(&mut col)?;
                 self.engine.add_column(&a.name, col)?;
                 Ok(ResultSet::AlterTable {
                     name: a.name.clone(),
@@ -454,7 +436,6 @@ impl<'a> Executor<'a> {
         for r in &rows {
             update_union_types(&mut col_types, r)?;
         }
-        let mut dedupe = false;
         for u in &s.unions {
             let mut sub = (*u.query).clone();
             sub.unions.clear();
@@ -478,19 +459,8 @@ impl<'a> Executor<'a> {
             }
             rows.extend(sub_rows);
             if !u.all {
-                dedupe = true;
+                rows = dedupe_rows(rows);
             }
-        }
-        if dedupe {
-            let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
-            let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                let key = GroupKey(r.0.clone());
-                if seen.insert(key) {
-                    out.push(r);
-                }
-            }
-            rows = out;
         }
         Ok(ResultSet::Select { columns, rows })
     }
@@ -536,6 +506,9 @@ impl<'a> Executor<'a> {
         }
         if let Some(having) = &s.having {
             collect_aggregates(having, &mut aggs)?;
+        }
+        for ob in &s.order_by {
+            collect_aggregates(&ob.expr, &mut aggs)?;
         }
 
         let grouped = !s.group_by.is_empty() || !aggs.is_empty();
@@ -672,7 +645,11 @@ impl<'a> Executor<'a> {
                 validate_grouped_expr(expr, &s.group_by)?;
             }
         }
-        if let Some(having) = &s.having {
+        let having = s
+            .having
+            .as_ref()
+            .map(|having| rewrite_aliases(having, &select_aliases));
+        if let Some(having) = &having {
             validate_grouped_expr(having, &s.group_by)?;
         }
         for ob in &s.order_by {
@@ -776,7 +753,7 @@ impl<'a> Executor<'a> {
             };
 
             // HAVING.
-            if let Some(having) = &s.having {
+            if let Some(having) = &having {
                 match eval_grouped_expr(having, key, &s.group_by, &aggs, &finals, &rep_resolver)? {
                     Value::Boolean(true) => {}
                     Value::Boolean(false) | Value::Null => continue,
@@ -943,11 +920,11 @@ impl<'a> Executor<'a> {
         }
 
         let mut to_update: Vec<(RowId, Row)> = Vec::new();
-        for (id, row) in scan {
+        for (id, row) in &scan {
             let resolver = SingleTable {
                 table: &table,
                 alias: &u.table,
-                row: &row,
+                row,
             };
             let take = match &u.r#where {
                 None => true,
@@ -969,18 +946,22 @@ impl<'a> Executor<'a> {
             for (idx, expr) in &assignments {
                 new_row.0[*idx] = eval_with(expr, &resolver)?;
             }
-            to_update.push((id, new_row));
+            to_update.push((*id, new_row));
         }
         let validated = validate_candidate_rows(
             &table,
-            &self.engine.scan(&u.table)?,
+            &scan,
             to_update.into_iter().map(|(id, row)| (Some(id), row)),
         )?;
-        let count = validated.len();
-        for (id, new) in validated {
-            let id = id.ok_or_else(|| Error::internal("validated UPDATE row without row id"))?;
-            self.engine.update(&u.table, id, new)?;
-        }
+        let updates: Vec<(RowId, Row)> = validated
+            .into_iter()
+            .map(|(id, row)| {
+                id.map(|id| (id, row))
+                    .ok_or_else(|| Error::internal("validated UPDATE row without row id"))
+            })
+            .collect::<Result<_>>()?;
+        let count = updates.len();
+        self.engine.update_batch(&u.table, &updates)?;
         Ok(ResultSet::Update { count })
     }
 
@@ -1059,12 +1040,23 @@ impl WideSchema {
     }
 
     fn lookup_qualified(&self, alias: &str, name: &str) -> Result<usize> {
-        for (i, c) in self.columns.iter().enumerate() {
-            if (c.alias == alias || c.table_name == alias) && c.column == name {
-                return Ok(i);
-            }
+        let matches: Vec<_> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| (c.alias == alias || c.table_name == alias) && c.column == name)
+            .collect();
+        match matches.len() {
+            0 => Err(Error::schema(format!("no such column `{alias}.{name}`"))),
+            1 => Ok(matches[0].0),
+            _ => Err(Error::schema(format!(
+                "ambiguous column `{alias}.{name}` — qualify with a unique table alias"
+            ))),
         }
-        Err(Error::schema(format!("no such column `{alias}.{name}`")))
+    }
+
+    fn aliases(&self) -> std::collections::BTreeSet<&str> {
+        self.columns.iter().map(|c| c.alias.as_str()).collect()
     }
 }
 
@@ -1280,6 +1272,13 @@ fn nested_loop_join(
     kind: JoinKind,
     on: &Expression,
 ) -> Result<(WideSchema, Vec<Row>)> {
+    let left_aliases = left.schema.aliases();
+    let right_aliases = right.schema.aliases();
+    if let Some(alias) = left_aliases.intersection(&right_aliases).next() {
+        return Err(Error::schema(format!(
+            "duplicate table alias `{alias}` in JOIN"
+        )));
+    }
     let mut combined_columns = left.schema.columns.clone();
     combined_columns.extend(right.schema.columns.iter().cloned());
     let combined_schema = WideSchema {
@@ -1501,17 +1500,18 @@ where
         validate_row_size(table, &row)?;
         validated.push((id, row));
     }
+    let updating_ids: HashSet<RowId> = validated.iter().filter_map(|(id, _)| *id).collect();
     for (col_idx, col) in table.columns.iter().enumerate() {
         if !col.unique && !col.primary_key {
             continue;
         }
-        for (idx, (id, row)) in validated.iter().enumerate() {
+        for (idx, (_id, row)) in validated.iter().enumerate() {
             let candidate = &row.0[col_idx];
             if candidate.is_null() {
                 continue;
             }
             for (existing_id, existing_row) in existing {
-                if Some(*existing_id) == *id {
+                if updating_ids.contains(existing_id) {
                     continue;
                 }
                 if let Some(true) = candidate.equal_sql(&existing_row.0[col_idx])? {
@@ -1549,6 +1549,23 @@ fn validate_row_for_table(table: &Table, raw: Row) -> Result<Row> {
         out.push(col.validate(v)?);
     }
     Ok(Row(out))
+}
+
+fn fold_column_default(col: &mut Column) -> Result<()> {
+    let Some(expr) = col.default.take() else {
+        return Ok(());
+    };
+    let default = eval(&expr).map_err(|e| {
+        Error::schema(format!(
+            "DEFAULT for column `{}` is not a constant: {e}",
+            col.name
+        ))
+    })?;
+    let coerced = col
+        .validate(default)
+        .map_err(|e| Error::schema(format!("DEFAULT for column `{}` is invalid: {e}", col.name)))?;
+    col.default = Some(Expression::Literal(literal_for_value(coerced)));
+    Ok(())
 }
 
 fn validate_row_size(table: &Table, row: &Row) -> Result<()> {
@@ -1594,6 +1611,18 @@ fn update_union_types(state: &mut [Option<crate::sql::ast::DataType>], row: &Row
         }
     }
     Ok(())
+}
+
+fn dedupe_rows(rows: Vec<Row>) -> Vec<Row> {
+    let mut seen: std::collections::BTreeSet<GroupKey> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = GroupKey(row.0.clone());
+        if seen.insert(key) {
+            out.push(row);
+        }
+    }
+    out
 }
 
 fn literal_for_value(v: Value) -> crate::sql::ast::Literal {
@@ -2041,6 +2070,17 @@ fn items_have_aggregate(s: &SelectStmt) -> bool {
             && collect_aggregates(expr, &mut tmp).is_ok()
             && !tmp.is_empty()
         {
+            return true;
+        }
+    }
+    if let Some(having) = &s.having
+        && collect_aggregates(having, &mut tmp).is_ok()
+        && !tmp.is_empty()
+    {
+        return true;
+    }
+    for ob in &s.order_by {
+        if collect_aggregates(&ob.expr, &mut tmp).is_ok() && !tmp.is_empty() {
             return true;
         }
     }

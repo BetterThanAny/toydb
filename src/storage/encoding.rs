@@ -107,17 +107,18 @@ pub fn decode_row(r: &mut &[u8]) -> Result<Row> {
 // Table schema
 // ---------------------------------------------------------------------
 
-pub fn encode_table(t: &Table, w: &mut Vec<u8>) {
+pub fn encode_table(t: &Table, w: &mut Vec<u8>) -> Result<()> {
     encode_string(&t.name, w);
-    w.extend_from_slice(&(t.columns.len() as u32).to_le_bytes());
+    w.extend_from_slice(&checked_len_u32(t.columns.len(), "column count")?.to_le_bytes());
     for c in &t.columns {
-        encode_column(c, w);
+        encode_column(c, w)?;
     }
-    w.extend_from_slice(&(t.indexes.len() as u32).to_le_bytes());
+    w.extend_from_slice(&checked_len_u32(t.indexes.len(), "index count")?.to_le_bytes());
     for index in &t.indexes {
         encode_string(&index.name, w);
         encode_string(&index.column, w);
     }
+    Ok(())
 }
 
 pub fn decode_table(r: &mut &[u8]) -> Result<Table> {
@@ -142,7 +143,7 @@ pub fn decode_table(r: &mut &[u8]) -> Result<Table> {
     Ok(table)
 }
 
-fn encode_column(c: &Column, w: &mut Vec<u8>) {
+fn encode_column(c: &Column, w: &mut Vec<u8>) -> Result<()> {
     encode_string(&c.name, w);
     w.push(datatype_tag(c.ty));
     let mut flags = 0u8;
@@ -160,11 +161,17 @@ fn encode_column(c: &Column, w: &mut Vec<u8>) {
         None => w.push(0),
         Some(expr) => {
             // We only persist literal defaults (constant-folded at create time).
-            let lit = literal_from_expr(expr).unwrap_or(Literal::Null);
+            let lit = literal_from_expr(expr).ok_or_else(|| {
+                Error::other(format!(
+                    "cannot encode non-literal DEFAULT for column `{}`",
+                    c.name
+                ))
+            })?;
             w.push(1);
             encode_value(&literal_to_value(lit), w);
         }
     }
+    Ok(())
 }
 
 fn decode_column(r: &mut &[u8]) -> Result<Column> {
@@ -314,6 +321,10 @@ fn encode_string(s: &str, w: &mut Vec<u8>) {
     w.extend_from_slice(b);
 }
 
+fn checked_len_u32(len: usize, label: &str) -> Result<u32> {
+    u32::try_from(len).map_err(|_| Error::other(format!("{label} {len} exceeds u32::MAX")))
+}
+
 fn decode_string(r: &mut &[u8]) -> Result<String> {
     let n = read_u32(r)? as usize;
     let bytes = read_bytes(r, n)?;
@@ -375,7 +386,7 @@ mod tests {
         t.add_index(Index::new("idx_users_name", "users", "name").unwrap())
             .unwrap();
         let mut buf = Vec::new();
-        encode_table(&t, &mut buf);
+        encode_table(&t, &mut buf).unwrap();
         let mut slice = buf.as_slice();
         let t2 = decode_table(&mut slice).unwrap();
         assert_eq!(t.name, t2.name);
@@ -387,6 +398,24 @@ mod tests {
         );
         assert_eq!(t2.indexes[0].name, "idx_users_name");
         assert_eq!(t2.indexes[0].column, "name");
+    }
+
+    #[test]
+    fn non_literal_default_is_not_silently_encoded_as_null() {
+        let t = Table::new(
+            "t",
+            vec![
+                Column::new("x", DataType::Integer).default_value(Expression::Binary(
+                    Box::new(Expression::Literal(Literal::Integer(1))),
+                    crate::sql::ast::BinaryOp::Add,
+                    Box::new(Expression::Literal(Literal::Integer(1))),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let err = encode_table(&t, &mut buf).unwrap_err().to_string();
+        assert!(err.contains("non-literal DEFAULT"), "{err}");
     }
 
     #[test]

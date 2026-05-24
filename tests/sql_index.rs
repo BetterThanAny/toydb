@@ -205,8 +205,9 @@ fn disk_wal_replay_rebuilds_index_without_stale_entries() {
             DELETE FROM users WHERE id = 1;
         ",
         );
-        // Intentionally no checkpoint: reopen replays WAL, then rebuilds
-        // the in-memory BTreeMap from recovered table pages.
+        // Simulate a process crash: reopen replays WAL, then rebuilds the
+        // in-memory BTreeMap from recovered table pages.
+        std::mem::forget(e);
     }
     {
         let mut e = DiskEngine::open(&path).unwrap();

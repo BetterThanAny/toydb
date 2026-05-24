@@ -35,6 +35,24 @@ pub trait Engine {
     // -- DML -----------------------------------------------------------
     fn insert(&mut self, table: &str, row: Row) -> Result<RowId>;
     fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>>;
+    /// Validate that a batch of row replacements can be applied without
+    /// changing storage state. Engines with page-local or batch-wide
+    /// constraints override this so the executor can fail a statement before
+    /// applying row 1 of N.
+    fn preflight_update_batch(&mut self, _table: &str, _updates: &[(RowId, Row)]) -> Result<()> {
+        Ok(())
+    }
+    /// Replace several rows as one logical UPDATE statement. Backends with
+    /// uniqueness checks should validate the final batch state before applying
+    /// the first row, so value swaps on UNIQUE columns are accepted while true
+    /// duplicates are still rejected.
+    fn update_batch(&mut self, table: &str, updates: &[(RowId, Row)]) -> Result<()> {
+        self.preflight_update_batch(table, updates)?;
+        for (id, row) in updates {
+            self.update(table, *id, row.clone())?;
+        }
+        Ok(())
+    }
     /// Replace the row at `id`. Validation and page-capacity failures are
     /// reported before the old row is changed; later I/O failures are
     /// storage-engine specific and may require WAL recovery.

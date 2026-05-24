@@ -56,7 +56,7 @@ impl Wal {
 
     pub fn append(&mut self, rec: &LogRecord) -> Result<()> {
         let mut payload = Vec::new();
-        encode_record(rec, &mut payload);
+        encode_record(rec, &mut payload)?;
         let mut framed = Vec::with_capacity(payload.len() + 4);
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         framed.extend_from_slice(&payload);
@@ -73,30 +73,38 @@ impl Wal {
         f.read_to_end(&mut buf)?;
         let mut slice = buf.as_slice();
         let mut out = Vec::new();
+        let mut offset = 0usize;
+        let mut truncate_to = None;
         while !slice.is_empty() {
             if slice.len() < 4 {
                 // Torn write at the end of the file — tolerate.
+                truncate_to = Some(offset);
                 break;
             }
+            let frame_start = offset;
             let len = u32::from_le_bytes(slice[..4].try_into().unwrap()) as usize;
             slice = &slice[4..];
+            offset += 4;
             if slice.len() < len {
-                if !out.is_empty() {
-                    return Err(Error::other("WAL: truncated record after valid prefix"));
-                }
                 // Tail-truncated WAL — ignore the partial record. This
                 // matches "torn write" semantics: the last commit either
                 // fully made it to disk or didn't.
+                truncate_to = Some(frame_start);
                 break;
             }
             let payload = &slice[..len];
             slice = &slice[len..];
+            offset += len;
             let mut p = payload;
             let rec = decode_record(&mut p)?;
             if !p.is_empty() {
                 return Err(Error::other("WAL: trailing bytes in record payload"));
             }
             out.push(rec);
+        }
+        if let Some(n) = truncate_to {
+            self.file.set_len(n as u64)?;
+            self.file.sync_data()?;
         }
         Ok(out)
     }
@@ -121,11 +129,11 @@ impl Wal {
 // Record encoding
 // ---------------------------------------------------------------------
 
-fn encode_record(rec: &LogRecord, out: &mut Vec<u8>) {
+fn encode_record(rec: &LogRecord, out: &mut Vec<u8>) -> Result<()> {
     match rec {
         LogRecord::CreateTable(t) => {
             out.push(1);
-            encode_table(t, out);
+            encode_table(t, out)?;
         }
         LogRecord::DropTable(name) => {
             out.push(2);
@@ -159,6 +167,7 @@ fn encode_record(rec: &LogRecord, out: &mut Vec<u8>) {
             out.extend_from_slice(&id.to_le_bytes());
         }
     }
+    Ok(())
 }
 
 fn decode_record(r: &mut &[u8]) -> Result<LogRecord> {
@@ -351,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_record_after_valid_prefix_errors() {
+    fn truncated_record_after_valid_prefix_is_ignored_and_truncated() {
         let path = tmppath();
         {
             let mut w = Wal::open(&path).unwrap();
@@ -368,8 +377,9 @@ mod tests {
             .write_all(&100u32.to_le_bytes())
             .unwrap();
         let mut w = Wal::open(&path).unwrap();
-        let err = w.replay().unwrap_err().to_string();
-        assert!(err.contains("truncated record after valid prefix"), "{err}");
+        let recs = w.replay().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 18);
         std::fs::remove_file(&path).ok();
     }
 

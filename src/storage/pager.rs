@@ -6,7 +6,7 @@
 //! Layout: page 0 is the *super page* with magic + version + free-list
 //! head + catalog root. Pages 1..N are user data.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -189,6 +189,21 @@ impl Pager {
         if id == 0 {
             return Err(Error::other("cannot deallocate super page"));
         }
+        if id >= self.page_count {
+            return Err(Error::other(format!(
+                "page {id} out of range for deallocate"
+            )));
+        }
+        if id == self.catalog_root {
+            return Err(Error::other("cannot deallocate current catalog root"));
+        }
+        let page = self.read_page(id)?;
+        if page.page_type()? == PageType::Free {
+            return Err(Error::other(format!("page {id} is already free")));
+        }
+        if self.free_list_contains(id)? {
+            return Err(Error::other(format!("page {id} is already in free list")));
+        }
         let mut p = Page::new(PageType::Free);
         p.set_next_page(self.free_head);
         self.cache.insert(
@@ -206,7 +221,13 @@ impl Pager {
     fn remove_from_free_list(&mut self, id: PageId) -> Result<()> {
         let mut cur = self.free_head;
         let mut prev = 0;
+        let mut seen = HashSet::new();
         while cur != 0 {
+            if !seen.insert(cur) {
+                return Err(Error::other(format!(
+                    "free list contains a cycle at page {cur}"
+                )));
+            }
             let page = self.read_page(cur)?;
             let next = page.next_page();
             if cur == id {
@@ -226,13 +247,31 @@ impl Pager {
         Ok(())
     }
 
+    fn free_list_contains(&mut self, id: PageId) -> Result<bool> {
+        let mut cur = self.free_head;
+        let mut seen = HashSet::new();
+        while cur != 0 {
+            if cur == id {
+                return Ok(true);
+            }
+            if !seen.insert(cur) {
+                return Err(Error::other(format!(
+                    "free list contains a cycle at page {cur}"
+                )));
+            }
+            cur = self.read_page(cur)?.next_page();
+        }
+        Ok(false)
+    }
+
     /// Persist all dirty pages and fsync the file.
     pub fn flush(&mut self) -> Result<()> {
-        let dirty: Vec<PageId> = self
+        let mut dirty: Vec<PageId> = self
             .cache
             .iter()
             .filter_map(|(k, v)| if v.dirty { Some(*k) } else { None })
             .collect();
+        dirty.sort_unstable_by_key(|id| (*id == SUPER_PAGE, *id));
         for id in dirty {
             let page = self.cache.get(&id).expect("dirty entry").page.clone();
             self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
@@ -409,6 +448,32 @@ mod tests {
             let id2 = p.allocate(PageType::TableData).unwrap();
             assert_eq!(id, id2);
             p.flush().unwrap();
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn deallocate_rejects_double_free() {
+        let path = tmpfile();
+        {
+            let mut p = Pager::open(&path).unwrap();
+            let id = p.allocate(PageType::TableData).unwrap();
+            p.deallocate(id).unwrap();
+            let err = p.deallocate(id).unwrap_err().to_string();
+            assert!(err.contains("already free"), "{err}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn deallocate_rejects_current_catalog_root() {
+        let path = tmpfile();
+        {
+            let mut p = Pager::open(&path).unwrap();
+            let id = p.allocate(PageType::Catalog).unwrap();
+            p.set_catalog_root(id).unwrap();
+            let err = p.deallocate(id).unwrap_err().to_string();
+            assert!(err.contains("catalog root"), "{err}");
         }
         std::fs::remove_file(&path).ok();
     }

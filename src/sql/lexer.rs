@@ -372,8 +372,11 @@ impl<'a> Lexer<'a> {
                 if b == b'\n' {
                     self.line += 1;
                     self.col = 1;
-                } else {
+                } else if b & 0b1100_0000 != 0b1000_0000 {
                     self.col += 1;
+                } else {
+                    // UTF-8 continuation byte: it advances the byte offset,
+                    // but not the source column.
                 }
             } else {
                 return;
@@ -758,6 +761,12 @@ mod tests {
         assert_eq!(v[2].col, 3);
         assert_eq!(v[3].line, 3);
         assert_eq!(v[3].col, 8);
+    }
+
+    #[test]
+    fn span_tracks_utf8_columns_as_characters() {
+        let err = lex_err("SELECT '你' @");
+        assert!(err.contains("col 12"), "{err}");
     }
 
     #[test]
