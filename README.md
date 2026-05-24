@@ -1,7 +1,7 @@
 # toydb
 
 A from-scratch SQL database engine in Rust, built as a teaching project.
-~10 000 lines of code, ~275 tests, no production dependencies beyond
+~13 700 lines of Rust, 288 tests, no production dependencies beyond
 `thiserror` and `rustyline`.
 
 ```sql
@@ -16,6 +16,17 @@ toydb> SELECT title, year FROM movies WHERE year >= 2016 ORDER BY rating DESC LI
 +---------+------+
 (2 rows)
 ```
+
+## 30-Second Summary
+
+| Signal | Details |
+| --- | --- |
+| Positioning | Rust SQL database engine from scratch, useful for showing storage, query execution, WAL, and index/planner fundamentals. |
+| Stack | Rust, hand-written lexer/parser, SQL executor, in-memory + page-based disk engine, WAL, runtime `BTreeMap` secondary indexes. |
+| Hard parts | SQL three-valued logic, joins/aggregates/subqueries, slotted pages, WAL replay, snapshot-style transactions, `CREATE INDEX` + `IndexScan` planning. |
+| Quick start | `cargo run --release -- examples/index_demo.sql` to see `SeqScan` switch to `IndexScan`. |
+| Validation | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`. |
+| Benchmark / result | 288 tests cover parser/executor/storage/WAL/index behavior; index demo shows update/delete maintenance, and index tests cover disk reopen/rebuild behavior. |
 
 ## What it does
 
@@ -51,7 +62,7 @@ toydb> SELECT title, year FROM movies WHERE year >= 2016 ORDER BY rating DESC LI
 
 ```bash
 cargo build --release
-cargo test --all                    # ~250 tests across unit + integration
+cargo test --all                    # 288 tests across unit + integration
 cargo clippy --all-targets -- -D warnings
 
 # REPL — in memory
@@ -150,7 +161,7 @@ src/
     ├── pager.rs         file-backed paged storage with cache
     └── wal.rs           append-only write-ahead log
 bin/toydb.rs           REPL entry
-tests/                 end-to-end SQL tests (basic, comprehensive, persistence, stress, transactions)
+tests/                 end-to-end SQL tests (basic, CLI, comprehensive, index, persistence, stress, transactions)
 examples/              sample SQL scripts
 ```
 
