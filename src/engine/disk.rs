@@ -19,7 +19,7 @@ use crate::engine::index::IndexStore;
 use crate::engine::{Engine, RowId};
 use crate::error::{Error, Result};
 use crate::storage::encoding::{decode_row, decode_table, encode_row, encode_table};
-use crate::storage::page::{PageId, PageType};
+use crate::storage::page::{Page, PageId, PageType};
 use crate::storage::pager::Pager;
 use crate::storage::wal::{LogRecord, Wal};
 use crate::types::row::Row;
@@ -88,6 +88,56 @@ impl DiskEngine {
         self.pager.flush()?;
         Ok(())
     }
+
+    fn insert_many(&mut self, table: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_def = self.catalog.get(table)?.clone();
+        let mut validated = Vec::with_capacity(rows.len());
+        for row in rows {
+            let row = validate_row(&table_def, row)?;
+            validate_row_size(&table_def, &row)?;
+            validated.push(row);
+        }
+
+        let existing = scan_table_pages(&mut self.pager, &self.table_heads, table)?;
+        check_unique_inserts_disk(&table_def, &existing, &validated)?;
+
+        let plan = plan_insert_pages(&mut self.pager, &self.table_heads, table, &validated)?;
+        self.wal.append(&LogRecord::InsertBatch {
+            table: table.to_string(),
+            rows: plan.records.clone(),
+        })?;
+
+        for page_id in &plan.new_page_ids {
+            self.pager
+                .ensure_page_id(*page_id, PageType::TableData, true)?;
+        }
+        for (page_id, page) in plan.pages {
+            self.pager.write_page(page_id, page)?;
+        }
+
+        let old_head = *self
+            .table_heads
+            .get(table)
+            .ok_or_else(|| Error::internal(format!("missing head for `{table}`")))?;
+        if plan.head != old_head {
+            self.table_heads.insert(table.to_string(), plan.head);
+            self.rewrite_catalog()?;
+        } else {
+            self.pager.flush()?;
+        }
+
+        for index in &table_def.indexes {
+            let col_idx = table_def.column_index(&index.column)?;
+            for (id, row) in &plan.records {
+                self.indexes.insert(&index.name, &row.0[col_idx], *id);
+            }
+        }
+        Ok(plan.records.into_iter().map(|(id, _)| id).collect())
+    }
 }
 
 impl Drop for DiskEngine {
@@ -131,19 +181,19 @@ impl Engine for DiskEngine {
             }
             return Err(Error::schema(format!("table `{name}` does not exist")));
         }
-        self.wal.append(&LogRecord::DropTable(name.to_string()))?;
         let table = self.catalog.get(name)?.clone();
         let head = *self
             .table_heads
             .get(name)
             .ok_or_else(|| Error::internal(format!("missing data head for `{name}`")))?;
+        let pages = collect_chain_pages(&mut self.pager, head, name)?;
+        self.wal.append(&LogRecord::DropTablePages {
+            table: name.to_string(),
+            pages: pages.clone(),
+        })?;
         // Free the page chain.
-        let mut cur = head;
-        while cur != 0 {
-            let page = self.pager.read_page(cur)?;
-            let next = page.next_page();
+        for cur in pages {
             self.pager.deallocate(cur)?;
-            cur = next;
         }
         self.catalog.drop_table(name)?;
         for index in table.indexes {
@@ -197,53 +247,13 @@ impl Engine for DiskEngine {
     }
 
     fn insert(&mut self, table: &str, row: Row) -> Result<RowId> {
-        let table_def = self.catalog.get(table)?.clone();
-        let row = validate_row(&table_def, row)?;
-        // Unique-check: scan everything. O(n) but obvious.
-        check_unique_disk(&mut self.pager, &self.table_heads, &table_def, &row, None)?;
-        let mut buf = Vec::new();
-        encode_row(&row, &mut buf);
-        let head = *self
-            .table_heads
-            .get(table)
-            .ok_or_else(|| Error::internal(format!("missing head for `{table}`")))?;
-        // Walk to find a page with room. If none fits, allocate a new
-        // page and link it as the new head (we prepend to keep insert
-        // O(1) when the head has space).
-        let mut cur = head;
-        let (id, page_id, page) = loop {
-            let mut page = self.pager.read_page(cur)?;
-            if let Ok(slot) = page.insert(&buf) {
-                break (make_row_id(cur, slot), cur, page);
-            }
-            let next = page.next_page();
-            if next == 0 {
-                // Allocate a new page and chain it.
-                let new = self.pager.allocate(PageType::TableData)?;
-                let mut new_page = self.pager.read_page(new)?;
-                let slot = new_page.insert(&buf)?;
-                // Link it: new.next = head, table_heads[table] = new.
-                new_page.set_next_page(head);
-                break (make_row_id(new, slot), new, new_page);
-            }
-            cur = next;
-        };
-        self.wal.append(&LogRecord::Insert {
-            table: table.to_string(),
-            id,
-            row: row.clone(),
-        })?;
-        self.pager.write_page(page_id, page)?;
-        if page_id != head {
-            self.table_heads.insert(table.to_string(), page_id);
-            self.rewrite_catalog()?;
-        }
-        self.pager.flush()?;
-        for index in &table_def.indexes {
-            let col_idx = table_def.column_index(&index.column)?;
-            self.indexes.insert(&index.name, &row.0[col_idx], id);
-        }
-        Ok(id)
+        let mut ids = self.insert_many(table, vec![row])?;
+        ids.pop()
+            .ok_or_else(|| Error::internal("single-row insert produced no row id"))
+    }
+
+    fn insert_batch(&mut self, table: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+        self.insert_many(table, rows)
     }
 
     fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>> {
@@ -446,6 +456,73 @@ fn validate_row_size(table: &Table, row: &Row) -> Result<()> {
     Ok(())
 }
 
+struct InsertPlan {
+    records: Vec<(RowId, Row)>,
+    pages: HashMap<PageId, Page>,
+    new_page_ids: Vec<PageId>,
+    head: PageId,
+}
+
+fn plan_insert_pages(
+    pager: &mut Pager,
+    heads: &HashMap<String, PageId>,
+    table: &str,
+    rows: &[Row],
+) -> Result<InsertPlan> {
+    let original_head = *heads
+        .get(table)
+        .ok_or_else(|| Error::internal(format!("missing head for `{table}`")))?;
+    let mut head = original_head;
+    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut new_page_ids = Vec::new();
+    let mut next_new_page = pager.page_count();
+    let mut records = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let mut buf = Vec::new();
+        encode_row(row, &mut buf);
+        let mut cur = head;
+        let mut seen = HashSet::new();
+        let id = loop {
+            if !seen.insert(cur) {
+                return Err(Error::other(format!(
+                    "page chain for `{table}` contains a cycle at page {cur}"
+                )));
+            }
+            let page = match pages.entry(cur) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(pager.read_page(cur)?)
+                }
+            };
+            if let Ok(slot) = page.insert(&buf) {
+                break make_row_id(cur, slot);
+            }
+            let next = page.next_page();
+            if next == 0 {
+                let new = next_new_page;
+                next_new_page += 1;
+                let mut new_page = Page::new(PageType::TableData);
+                let slot = new_page.insert(&buf)?;
+                new_page.set_next_page(head);
+                pages.insert(new, new_page);
+                new_page_ids.push(new);
+                head = new;
+                break make_row_id(new, slot);
+            }
+            cur = next;
+        };
+        records.push((id, row.clone()));
+    }
+
+    Ok(InsertPlan {
+        records,
+        pages,
+        new_page_ids,
+        head,
+    })
+}
+
 fn preflight_update_pages(pager: &mut Pager, updates: &[(RowId, Row)]) -> Result<()> {
     let mut pages = HashMap::new();
     for (id, row) in updates {
@@ -499,6 +576,37 @@ fn check_unique_disk(
                 }
             }
             cur = page.next_page();
+        }
+    }
+    Ok(())
+}
+
+fn check_unique_inserts_disk(table: &Table, existing: &[(RowId, Row)], rows: &[Row]) -> Result<()> {
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if !col.unique && !col.primary_key {
+            continue;
+        }
+        for (idx, row) in rows.iter().enumerate() {
+            let candidate = &row.0[col_idx];
+            if candidate.is_null() {
+                continue;
+            }
+            for (_, existing_row) in existing {
+                if let Some(true) = candidate.equal_sql(&existing_row.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
+            for prior in &rows[..idx] {
+                if let Some(true) = candidate.equal_sql(&prior.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -573,6 +681,23 @@ fn scan_table_pages(
             let row = decode_row(&mut s)?;
             out.push((id, row));
         }
+        cur = page.next_page();
+    }
+    Ok(out)
+}
+
+fn collect_chain_pages(pager: &mut Pager, head: PageId, label: &str) -> Result<Vec<PageId>> {
+    let mut out = Vec::new();
+    let mut cur = head;
+    let mut seen = HashSet::new();
+    while cur != 0 {
+        if !seen.insert(cur) {
+            return Err(Error::other(format!(
+                "page chain `{label}` contains a cycle at page {cur}"
+            )));
+        }
+        let page = pager.read_page(cur)?;
+        out.push(cur);
         cur = page.next_page();
     }
     Ok(out)
@@ -740,17 +865,38 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                     .get(name)
                     .ok_or_else(|| Error::internal(format!("replay: missing head for `{name}`")))?;
                 let mut cur = head;
+                let mut seen = HashSet::new();
                 while cur != 0 {
-                    let page = pager.read_page(cur)?;
-                    if page.page_type()? == PageType::Free {
-                        break;
+                    if !seen.insert(cur) {
+                        return Err(Error::other(format!(
+                            "replay: page chain for `{name}` contains a cycle at page {cur}"
+                        )));
                     }
+                    let page = pager.read_page(cur)?;
                     let next = page.next_page();
-                    pager.deallocate(cur)?;
+                    if page.page_type()? != PageType::Free {
+                        pager.deallocate(cur)?;
+                    }
                     cur = next;
                 }
                 catalog.drop_table(name)?;
                 heads.remove(name);
+            }
+            LogRecord::DropTablePages { table, pages } => {
+                if !catalog.contains(table) {
+                    continue;
+                }
+                for page_id in pages {
+                    if *page_id == 0 || *page_id >= pager.page_count() {
+                        continue;
+                    }
+                    let page = pager.read_page(*page_id)?;
+                    if page.page_type()? != PageType::Free {
+                        pager.deallocate(*page_id)?;
+                    }
+                }
+                catalog.drop_table(table)?;
+                heads.remove(table);
             }
             LogRecord::CreateIndex(index) => {
                 if !catalog.contains(&index.table) || catalog.index_exists(&index.name) {
@@ -788,6 +934,28 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 }
                 page.insert_at(expected_slot, &buf)?;
                 pager.write_page(page_id, page)?;
+            }
+            LogRecord::InsertBatch { table, rows } => {
+                if !catalog.contains(table) {
+                    continue;
+                }
+                for (id, row) in rows {
+                    let (page_id, expected_slot) = split_row_id(*id);
+                    let mut buf = Vec::new();
+                    encode_row(row, &mut buf);
+                    ensure_replay_page_in_chain(pager, &mut heads, table, page_id)?;
+                    let mut page = pager.read_page(page_id)?;
+                    if page.get(expected_slot) == Some(buf.as_slice()) {
+                        continue;
+                    }
+                    if page.get(expected_slot).is_some()
+                        && has_later_record_for_row(&recs, idx, table, *id)
+                    {
+                        continue;
+                    }
+                    page.insert_at(expected_slot, &buf)?;
+                    pager.write_page(page_id, page)?;
+                }
             }
             LogRecord::Update { table, id, row } => {
                 if !catalog.contains(table) {
@@ -842,7 +1010,12 @@ fn has_later_record_for_row(recs: &[LogRecord], idx: usize, table: &str, id: Row
             table: later_table,
             id: later_id,
         } => later_table == table && *later_id == id,
+        LogRecord::InsertBatch {
+            table: later_table,
+            rows,
+        } => later_table == table && rows.iter().any(|(later_id, _)| *later_id == id),
         LogRecord::DropTable(name) => name == table,
+        LogRecord::DropTablePages { table: name, .. } => name == table,
         LogRecord::CreateTable(_) | LogRecord::CreateIndex(_) | LogRecord::DropIndex(_) => false,
     })
 }

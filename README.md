@@ -188,6 +188,9 @@ examples/              sample SQL scripts
   in SELECT and HAVING shares one accumulator per group.
 - **Snapshot isolation = clone-on-begin.** Cheap and obvious for a
   teaching engine; the disk engine does not yet support transactions.
+  Statement errors inside a memory-engine transaction do not automatically
+  roll the transaction back, so clients should issue `ROLLBACK` explicitly
+  if they want to abandon earlier successful statements in the same `BEGIN`.
 - **Secondary indexes are metadata-persistent, tree-rebuilt.** The
   catalog stores `Index { name, table, column }`. Engines maintain a
   runtime `BTreeMap<Value, BTreeSet<RowId>>`; the disk engine rebuilds

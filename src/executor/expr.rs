@@ -482,9 +482,10 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
             check_arity(name, 2, &evaled)?;
             match (&evaled[0], &evaled[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Integer(a), Value::Integer(b)) if *b != 0 => {
-                    Ok(Value::Integer(a.wrapping_rem(*b)))
-                }
+                (Value::Integer(a), Value::Integer(b)) if *b != 0 => Ok(Value::Integer(
+                    a.checked_rem(*b)
+                        .ok_or_else(|| Error::value("integer modulo overflow"))?,
+                )),
                 (Value::Integer(_), Value::Integer(_)) => Err(Error::value("MOD by zero")),
                 (a, b) if numeric(a) && numeric(b) => {
                     Ok(Value::Float(to_f64(a.clone()) % to_f64(b.clone())))
@@ -638,10 +639,15 @@ fn substring(vs: &[Value]) -> Result<Value> {
             )));
         }
     };
-    // SQL is 1-based.
+    // SQL is 1-based for positive starts. Non-positive starts open the
+    // extraction window before the string and only return the overlap.
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
-    let start_idx = start.saturating_sub(1).max(0).min(len) as usize;
+    let start_idx = if start > 0 {
+        start.saturating_sub(1).min(len)
+    } else {
+        0
+    } as usize;
     let end_idx = if vs.len() == 3 {
         let take = match &vs[2] {
             Value::Null => return Ok(Value::Null),
@@ -653,8 +659,15 @@ fn substring(vs: &[Value]) -> Result<Value> {
                 )));
             }
         };
-        let take = take.max(0) as usize;
-        start_idx.saturating_add(take).min(chars.len())
+        if take < 0 {
+            return Err(Error::value("SUBSTRING length must be non-negative"));
+        }
+        let end = if start > 0 {
+            start.saturating_sub(1).saturating_add(take)
+        } else {
+            start.saturating_add(take)
+        };
+        end.max(0).min(len) as usize
     } else {
         chars.len()
     };
@@ -819,6 +832,8 @@ mod tests {
             ev("SUBSTRING('abc', 2, 9223372036854775807)"),
             Value::String("bc".into())
         );
+        assert_eq!(ev("SUBSTRING('abcdef', -3, 4)"), Value::String("a".into()));
+        assert!(ev_err("SUBSTRING('abcdef', 1, -1)").contains("non-negative"));
     }
 
     #[test]
@@ -933,6 +948,7 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(ev("MOD(10, 3)"), Value::Integer(1));
+        assert!(ev_err("MOD(-9223372036854775807 - 1, -1)").contains("overflow"));
     }
 
     #[test]

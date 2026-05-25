@@ -46,7 +46,11 @@ fn parse_args() -> Args {
     while let Some(a) = iter.next() {
         match a.as_str() {
             "--db" => {
-                args.db = iter.next().map(PathBuf::from);
+                let Some(path) = iter.next() else {
+                    eprintln!("--db requires a path");
+                    std::process::exit(2);
+                };
+                args.db = Some(PathBuf::from(path));
             }
             "--help" | "-h" => args.help = true,
             other if other.starts_with("--") => {
@@ -103,7 +107,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let trimmed = line.trim();
         if buf.is_empty() {
-            if let Some(rest) = trimmed.strip_prefix(".schema") {
+            if let Some(rest) = parse_schema_meta_command(trimmed) {
                 let name = rest.trim();
                 print_schema(engine.as_ref(), name);
                 continue;
@@ -134,6 +138,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = rl.save_history(".toydb_history");
     Ok(())
+}
+
+fn parse_schema_meta_command(trimmed: &str) -> Option<&str> {
+    match trimmed.strip_prefix(".schema") {
+        Some("") => Some(""),
+        Some(rest) => rest
+            .chars()
+            .next()
+            .filter(|c| c.is_whitespace())
+            .map(|c| &rest[c.len_utf8()..]),
+        None => None,
+    }
 }
 
 fn execute_buffer(engine: &mut dyn Engine, sql: &str) {
@@ -217,5 +233,18 @@ fn print_schema(engine: &dyn Engine, name: &str) {
             }
             Err(e) => eprintln!("error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_schema_meta_command;
+
+    #[test]
+    fn schema_meta_command_requires_boundary() {
+        assert_eq!(parse_schema_meta_command(".schema"), Some(""));
+        assert_eq!(parse_schema_meta_command(".schema users"), Some("users"));
+        assert_eq!(parse_schema_meta_command(".schema\tusers"), Some("users"));
+        assert_eq!(parse_schema_meta_command(".schemafoo"), None);
     }
 }

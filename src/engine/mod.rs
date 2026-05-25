@@ -34,6 +34,16 @@ pub trait Engine {
 
     // -- DML -----------------------------------------------------------
     fn insert(&mut self, table: &str, row: Row) -> Result<RowId>;
+    /// Insert several rows as one logical INSERT statement. Engines that have
+    /// durable write-ahead logging should make this atomic at the statement
+    /// level instead of exposing row-by-row partial success after an I/O error.
+    fn insert_batch(&mut self, table: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            ids.push(self.insert(table, row)?);
+        }
+        Ok(ids)
+    }
     fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>>;
     /// Validate that a batch of row replacements can be applied without
     /// changing storage state. Engines with page-local or batch-wide

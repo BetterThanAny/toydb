@@ -197,6 +197,42 @@ fn wal_replay_survives_delete_insert_slot_reuse() {
 }
 
 #[test]
+fn wal_replay_recovers_multi_value_insert_as_batch() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "CREATE TABLE big (id INT PRIMARY KEY, payload TEXT)",
+        );
+        let payload = "x".repeat(500);
+        let mut insert = String::from("INSERT INTO big VALUES ");
+        for i in 0..40 {
+            if i > 0 {
+                insert.push(',');
+            }
+            insert.push_str(&format!("({i}, '{payload}')"));
+        }
+        insert.push(';');
+        run_all(&mut e, &insert);
+        // Simulate a process crash before the clean-exit checkpoint truncates
+        // the batch WAL record.
+        std::mem::forget(e);
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT COUNT(*) FROM big");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Integer(40));
+            }
+            _ => panic!(),
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
 fn unique_constraint_persists() {
     let path = tmpdb();
     {
@@ -451,6 +487,33 @@ fn drop_table_persists() {
     {
         let e = DiskEngine::open(&path).unwrap();
         assert!(e.get_table("t").is_err());
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn wal_replay_recovers_drop_table_pages() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "CREATE TABLE big (id INT PRIMARY KEY, payload TEXT)",
+        );
+        let payload = "x".repeat(500);
+        for i in 0..40 {
+            run(
+                &mut e,
+                &format!("INSERT INTO big VALUES ({i}, '{payload}')"),
+            );
+        }
+        e.checkpoint().unwrap();
+        run_all(&mut e, "DROP TABLE big");
+        std::mem::forget(e);
+    }
+    {
+        let e = DiskEngine::open(&path).unwrap();
+        assert!(e.get_table("big").is_err());
     }
     cleanup(&path);
 }

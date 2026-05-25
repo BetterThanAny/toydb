@@ -394,9 +394,10 @@ impl<'a> Executor<'a> {
             full_rows.into_iter().map(|row| (None, row)),
         )?;
         let count = validated.len();
-        for (_, row) in validated {
-            self.engine.insert(&i.table, row)?;
-        }
+        self.engine.insert_batch(
+            &i.table,
+            validated.into_iter().map(|(_, row)| row).collect(),
+        )?;
         Ok(ResultSet::Insert { count })
     }
 
@@ -1252,12 +1253,10 @@ fn index_key_compatible(column_ty: crate::sql::ast::DataType, key: &Value) -> bo
     use crate::sql::ast::DataType;
     matches!(
         (column_ty, key),
-        (_, Value::Null)
-            | (
-                DataType::Integer | DataType::Float,
-                Value::Integer(_) | Value::Float(_)
-            )
-            | (DataType::Boolean, Value::Boolean(_))
+        (
+            DataType::Integer | DataType::Float,
+            Value::Integer(_) | Value::Float(_)
+        ) | (DataType::Boolean, Value::Boolean(_))
             | (DataType::String, Value::String(_))
     )
 }
@@ -1476,6 +1475,7 @@ fn limit_eval(expr: &Option<Expression>, label: &str) -> Result<usize> {
                 Value::Integer(n) => Err(Error::value(format!(
                     "{label} must be non-negative, got {n}"
                 ))),
+                Value::Null if label == "LIMIT" => Ok(usize::MAX),
                 Value::Null => Ok(0),
                 other => Err(Error::ty(format!(
                     "{label} expects integer, got {}",
@@ -1949,19 +1949,19 @@ fn describe_plan(engine: &dyn Engine, stmt: &Statement) -> Result<String> {
             InsertSource::Select(_) => format!("Insert into `{}` (from SELECT)", i.table),
         },
         Statement::Update(u) => format!(
-            "Update `{}`{}",
+            "Update `{}` (seq scan{})",
             u.table,
             if u.r#where.is_some() {
-                " (filtered)"
+                ", filtered"
             } else {
                 ""
             }
         ),
         Statement::Delete(d) => format!(
-            "Delete from `{}`{}",
+            "Delete from `{}` (seq scan{})",
             d.table,
             if d.r#where.is_some() {
-                " (filtered)"
+                ", filtered"
             } else {
                 ""
             }

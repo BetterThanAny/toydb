@@ -18,6 +18,7 @@ use crate::catalog::Index;
 use crate::engine::RowId;
 use crate::error::{Error, Result};
 use crate::storage::encoding::{decode_row, decode_table, encode_row, encode_table};
+use crate::storage::page::PageId;
 use crate::types::row::Row;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,12 +27,21 @@ pub enum LogRecord {
     CreateTable(crate::catalog::Table),
     /// `DROP TABLE`.
     DropTable(String),
+    /// `DROP TABLE` with the exact page chain captured before any page is
+    /// deallocated. Newer disk engines use this to make replay idempotent even
+    /// if a crash left some table pages already on the free list.
+    DropTablePages { table: String, pages: Vec<PageId> },
     /// `CREATE INDEX`.
     CreateIndex(Index),
     /// `DROP INDEX`.
     DropIndex(String),
     /// `INSERT` returned this row id.
     Insert { table: String, id: RowId, row: Row },
+    /// Batch INSERT committed as one statement.
+    InsertBatch {
+        table: String,
+        rows: Vec<(RowId, Row)>,
+    },
     /// `UPDATE` of an existing row.
     Update { table: String, id: RowId, row: Row },
     /// `DELETE` by row id.
@@ -139,6 +149,16 @@ fn encode_record(rec: &LogRecord, out: &mut Vec<u8>) -> Result<()> {
             out.push(2);
             encode_string(name, out);
         }
+        LogRecord::DropTablePages { table, pages } => {
+            out.push(9);
+            encode_string(table, out);
+            out.extend_from_slice(
+                &checked_len_u32(pages.len(), "drop-table page count")?.to_le_bytes(),
+            );
+            for page in pages {
+                out.extend_from_slice(&page.to_le_bytes());
+            }
+        }
         LogRecord::CreateIndex(index) => {
             out.push(6);
             encode_string(&index.name, out);
@@ -154,6 +174,17 @@ fn encode_record(rec: &LogRecord, out: &mut Vec<u8>) -> Result<()> {
             encode_string(table, out);
             out.extend_from_slice(&id.to_le_bytes());
             encode_row(row, out);
+        }
+        LogRecord::InsertBatch { table, rows } => {
+            out.push(8);
+            encode_string(table, out);
+            out.extend_from_slice(
+                &checked_len_u32(rows.len(), "insert batch row count")?.to_le_bytes(),
+            );
+            for (id, row) in rows {
+                out.extend_from_slice(&id.to_le_bytes());
+                encode_row(row, out);
+            }
         }
         LogRecord::Update { table, id, row } => {
             out.push(4);
@@ -175,6 +206,15 @@ fn decode_record(r: &mut &[u8]) -> Result<LogRecord> {
     Ok(match tag {
         1 => LogRecord::CreateTable(decode_table(r)?),
         2 => LogRecord::DropTable(decode_string(r)?),
+        9 => {
+            let table = decode_string(r)?;
+            let count = take_u32(r)? as usize;
+            let mut pages = Vec::with_capacity(count);
+            for _ in 0..count {
+                pages.push(take_u64(r)?);
+            }
+            LogRecord::DropTablePages { table, pages }
+        }
         6 => LogRecord::CreateIndex(Index::new(
             decode_string(r)?,
             decode_string(r)?,
@@ -186,6 +226,15 @@ fn decode_record(r: &mut &[u8]) -> Result<LogRecord> {
             id: take_u64(r)?,
             row: decode_row(r)?,
         },
+        8 => {
+            let table = decode_string(r)?;
+            let count = take_u32(r)? as usize;
+            let mut rows = Vec::with_capacity(count);
+            for _ in 0..count {
+                rows.push((take_u64(r)?, decode_row(r)?));
+            }
+            LogRecord::InsertBatch { table, rows }
+        }
         4 => LogRecord::Update {
             table: decode_string(r)?,
             id: take_u64(r)?,
@@ -214,6 +263,10 @@ fn decode_string(r: &mut &[u8]) -> Result<String> {
         String::from_utf8(r[..n].to_vec()).map_err(|e| Error::other(format!("WAL utf-8: {e}")))?;
     *r = &r[n..];
     Ok(s)
+}
+
+fn checked_len_u32(len: usize, label: &str) -> Result<u32> {
+    u32::try_from(len).map_err(|_| Error::other(format!("{label} {len} exceeds u32::MAX")))
 }
 
 fn take_u8(r: &mut &[u8]) -> Result<u8> {
@@ -281,6 +334,33 @@ mod tests {
             LogRecord::CreateTable(t) => assert_eq!(t.name, "t"),
             _ => panic!(),
         }
+        match &recs[1] {
+            LogRecord::DropTable(name) => assert_eq!(name, "t"),
+            _ => panic!(),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn roundtrip_drop_table_pages() {
+        let path = tmppath();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.append(&LogRecord::DropTablePages {
+                table: "t".into(),
+                pages: vec![2, 3, 5],
+            })
+            .unwrap();
+        }
+        let mut w = Wal::open(&path).unwrap();
+        let recs = w.replay().unwrap();
+        assert_eq!(
+            recs,
+            vec![LogRecord::DropTablePages {
+                table: "t".into(),
+                pages: vec![2, 3, 5],
+            }]
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -293,6 +373,14 @@ mod tests {
                 table: "t".into(),
                 id: 7,
                 row: Row(vec![Value::Integer(42)]),
+            })
+            .unwrap();
+            w.append(&LogRecord::InsertBatch {
+                table: "t".into(),
+                rows: vec![
+                    (8, Row(vec![Value::Integer(43)])),
+                    (9, Row(vec![Value::Integer(44)])),
+                ],
             })
             .unwrap();
             w.append(&LogRecord::Update {
@@ -309,7 +397,14 @@ mod tests {
         }
         let mut w = Wal::open(&path).unwrap();
         let recs = w.replay().unwrap();
-        assert_eq!(recs.len(), 3);
+        assert_eq!(recs.len(), 4);
+        match &recs[1] {
+            LogRecord::InsertBatch { table, rows } => {
+                assert_eq!(table, "t");
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!(),
+        }
         std::fs::remove_file(&path).ok();
     }
 

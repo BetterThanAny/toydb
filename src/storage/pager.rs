@@ -264,23 +264,47 @@ impl Pager {
         Ok(false)
     }
 
-    /// Persist all dirty pages and fsync the file.
+    /// Persist all dirty pages and fsync the file. Data/catalog pages are
+    /// forced before the super page, then the super page is forced separately,
+    /// so metadata does not advertise page-list changes before the pages they
+    /// reference have reached the storage device.
     pub fn flush(&mut self) -> Result<()> {
-        let mut dirty: Vec<PageId> = self
+        let mut non_super: Vec<PageId> = self
             .cache
             .iter()
-            .filter_map(|(k, v)| if v.dirty { Some(*k) } else { None })
+            .filter_map(|(k, v)| {
+                if v.dirty && *k != SUPER_PAGE {
+                    Some(*k)
+                } else {
+                    None
+                }
+            })
             .collect();
-        dirty.sort_unstable_by_key(|id| (*id == SUPER_PAGE, *id));
-        for id in dirty {
-            let page = self.cache.get(&id).expect("dirty entry").page.clone();
-            self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
+        non_super.sort_unstable();
+        self.flush_pages(&non_super)?;
+
+        let super_dirty = self.cache.get(&SUPER_PAGE).is_some_and(|entry| entry.dirty);
+        if super_dirty {
+            self.flush_pages(&[SUPER_PAGE])?;
+        }
+        Ok(())
+    }
+
+    fn flush_pages(&mut self, ids: &[PageId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for id in ids {
+            let page = self.cache.get(id).expect("dirty entry").page.clone();
+            self.file.seek(SeekFrom::Start(*id * PAGE_SIZE as u64))?;
             self.file.write_all(page.raw())?;
-            if let Some(e) = self.cache.get_mut(&id) {
+        }
+        self.file.sync_data()?;
+        for id in ids {
+            if let Some(e) = self.cache.get_mut(id) {
                 e.dirty = false;
             }
         }
-        self.file.sync_data()?;
         Ok(())
     }
 

@@ -24,6 +24,18 @@ fn script_mode_returns_nonzero_on_error() {
     assert!(stderr.contains("fatal:"), "{stderr}");
 }
 
+#[test]
+fn db_flag_requires_path() {
+    let output = Command::new(env!("CARGO_BIN_EXE_toydb"))
+        .arg("--db")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--db requires a path"), "{stderr}");
+}
+
 fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

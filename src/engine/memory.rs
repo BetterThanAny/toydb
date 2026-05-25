@@ -159,6 +159,36 @@ impl Engine for MemoryEngine {
         Ok(id)
     }
 
+    fn insert_batch(&mut self, table: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+        let table_def = self.catalog.get(table)?.clone();
+        let store = self
+            .data
+            .get(table)
+            .ok_or_else(|| Error::internal("missing data storage"))?;
+        let mut validated = Vec::with_capacity(rows.len());
+        for row in rows {
+            validated.push(self.validate_row(&table_def, row)?);
+        }
+        check_unique_inserts(&table_def, store, &validated)?;
+
+        let store = self
+            .data
+            .get_mut(table)
+            .ok_or_else(|| Error::internal("missing data storage"))?;
+        let mut ids = Vec::with_capacity(validated.len());
+        for row in validated {
+            self.next_id += 1;
+            let id = self.next_id;
+            store.insert(id, row.clone());
+            for index in &table_def.indexes {
+                let col_idx = table_def.column_index(&index.column)?;
+                self.indexes.insert(&index.name, &row.0[col_idx], id);
+            }
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
     fn scan(&mut self, table: &str) -> Result<Vec<(RowId, Row)>> {
         let _ = self.catalog.get(table)?;
         Ok(self
@@ -352,7 +382,7 @@ impl Engine for MemoryEngine {
             )));
         }
         let row_count = self.data.get(table).map_or(0, |rows| rows.len());
-        if (column.primary_key || column.unique) && !default.is_null() && row_count > 1 {
+        if (column.primary_key || column.unique) && !default.is_null() && row_count >= 1 {
             return Err(Error::constraint(format!(
                 "duplicate value for unique column `{}`: {}",
                 column.name, default
@@ -373,6 +403,41 @@ impl Engine for MemoryEngine {
         }
         Ok(())
     }
+}
+
+fn check_unique_inserts(
+    table: &Table,
+    existing: &BTreeMap<RowId, Row>,
+    rows: &[Row],
+) -> Result<()> {
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if !col.unique && !col.primary_key {
+            continue;
+        }
+        for (idx, row) in rows.iter().enumerate() {
+            let candidate = &row.0[col_idx];
+            if candidate.is_null() {
+                continue;
+            }
+            for existing_row in existing.values() {
+                if let Some(true) = candidate.equal_sql(&existing_row.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
+            for prior in &rows[..idx] {
+                if let Some(true) = candidate.equal_sql(&prior.0[col_idx])? {
+                    return Err(Error::constraint(format!(
+                        "duplicate value for unique column `{}`: {}",
+                        col.name, candidate
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_unique_updates(

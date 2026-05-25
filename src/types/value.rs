@@ -73,7 +73,7 @@ impl Value {
                         "cannot convert non-integral float {f} to INTEGER"
                     )));
                 }
-                if *f < i64::MIN as f64 || *f > i64::MAX as f64 {
+                if *f < i64::MIN as f64 || *f >= 9223372036854775808.0_f64 {
                     return Err(Error::ty(format!("float {f} is out of range for INTEGER")));
                 }
                 Value::Integer(*f as i64)
@@ -92,8 +92,8 @@ impl Value {
                     .map_err(|_| Error::ty(format!("cannot parse `{s}` as FLOAT")))?,
             ),
             (Value::String(s), DataType::Boolean) => match s.to_ascii_lowercase().as_str() {
-                "true" | "t" | "1" => Value::Boolean(true),
-                "false" | "f" | "0" => Value::Boolean(false),
+                "true" => Value::Boolean(true),
+                "false" => Value::Boolean(false),
                 _ => return Err(Error::ty(format!("cannot parse `{s}` as BOOLEAN"))),
             },
         })
@@ -274,6 +274,11 @@ mod tests {
         );
         assert!(Value::Float(3.9).coerce(DataType::Integer).is_err());
         assert!(Value::Float(1e20).coerce(DataType::Integer).is_err());
+        assert!(
+            Value::Float(9223372036854775808.0)
+                .coerce(DataType::Integer)
+                .is_err()
+        );
     }
 
     #[test]
@@ -310,6 +315,8 @@ mod tests {
                 .coerce(DataType::Boolean)
                 .is_err()
         );
+        assert!(Value::String("1".into()).coerce(DataType::Boolean).is_err());
+        assert!(Value::String("t".into()).coerce(DataType::Boolean).is_err());
     }
 
     #[test]

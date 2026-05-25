@@ -161,6 +161,49 @@ fn index_scan_still_applies_full_where_predicate() {
 }
 
 #[test]
+fn null_equality_does_not_choose_index_scan() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE users (id INT PRIMARY KEY, age INT);
+        INSERT INTO users VALUES (1, NULL), (2, 20);
+        CREATE INDEX idx_users_age ON users(age);
+    ",
+    );
+
+    let plan = explain(&mut e, "EXPLAIN SELECT id FROM users WHERE age = NULL");
+    assert!(plan.contains("SeqScan"), "{plan}");
+    assert!(!plan.contains("IndexScan"), "{plan}");
+    let rows = select_rows(run(&mut e, "SELECT id FROM users WHERE age = NULL"));
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn explain_update_delete_reports_seq_scan() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE users (id INT PRIMARY KEY, age INT);
+        INSERT INTO users VALUES (1, 20), (2, 30);
+        CREATE INDEX idx_users_age ON users(age);
+    ",
+    );
+
+    let plan = explain(&mut e, "EXPLAIN UPDATE users SET age = 21 WHERE age = 20");
+    assert!(
+        plan.contains("Update `users` (seq scan, filtered)"),
+        "{plan}"
+    );
+    let plan = explain(&mut e, "EXPLAIN DELETE FROM users WHERE age = 30");
+    assert!(
+        plan.contains("Delete from `users` (seq scan, filtered)"),
+        "{plan}"
+    );
+}
+
+#[test]
 fn disk_index_metadata_survives_reopen_and_rebuilds_tree() {
     let path = tmpdb();
     {

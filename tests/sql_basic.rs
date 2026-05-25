@@ -233,6 +233,26 @@ fn alter_table_rejects_duplicate_unique_default() {
 }
 
 #[test]
+fn alter_table_rejects_unique_default_on_single_existing_row() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (name TEXT);
+        INSERT INTO t VALUES ('a');
+    ",
+    );
+
+    let err = try_run(
+        &mut e,
+        "ALTER TABLE t ADD COLUMN email TEXT UNIQUE DEFAULT 'same'",
+    )
+    .unwrap_err();
+    assert!(err.contains("duplicate"));
+    assert!(try_run(&mut e, "SELECT email FROM t").is_err());
+}
+
+#[test]
 fn alter_table_rejects_duplicate_primary_key_default() {
     let mut e = MemoryEngine::new();
     run_all(
@@ -488,6 +508,26 @@ fn distinct_is_applied_before_offset() {
         ResultSet::Select { rows, .. } => {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][0], Value::Integer(20));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn limit_null_is_unbounded() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT PRIMARY KEY);
+        INSERT INTO t VALUES (1), (2), (3);
+    ",
+    );
+    let r = run(&mut e, "SELECT id FROM t ORDER BY id LIMIT NULL");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[2][0], Value::Integer(3));
         }
         _ => panic!(),
     }
