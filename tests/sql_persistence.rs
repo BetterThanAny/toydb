@@ -8,6 +8,8 @@ use toydb::engine::{DiskEngine, Engine};
 use toydb::executor::{Executor, ResultSet};
 use toydb::sql::Parser;
 use toydb::storage::PAGE_SIZE;
+use toydb::storage::page::HEADER_SIZE;
+use toydb::storage::wal::{LogRecord, Wal};
 use toydb::types::value::Value;
 
 fn tmpdb() -> PathBuf {
@@ -107,6 +109,86 @@ fn updates_and_deletes_survive() {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][1], Value::Integer(11));
                 assert_eq!(rows[1][1], Value::Integer(21));
+            }
+            _ => panic!(),
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn disk_update_delete_write_statement_batch_wal_records() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (id INT PRIMARY KEY, v INT);
+            INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+        ",
+        );
+        e.checkpoint().unwrap();
+        run_all(
+            &mut e,
+            "
+            UPDATE t SET v = v + 100 WHERE id <= 2;
+            DELETE FROM t WHERE id >= 2;
+        ",
+        );
+
+        let mut wal = Wal::open(wal_path(&path)).unwrap();
+        let recs = wal.replay().unwrap();
+        assert!(
+            recs.iter().any(|r| matches!(
+                r,
+                LogRecord::UpdateBatch { table, rows } if table == "t" && rows.len() == 2
+            )),
+            "{recs:?}"
+        );
+        assert!(
+            recs.iter().any(|r| matches!(
+                r,
+                LogRecord::DeleteBatch { table, ids } if table == "t" && ids.len() == 2
+            )),
+            "{recs:?}"
+        );
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn wal_replay_recovers_update_and_delete_batches() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (id INT PRIMARY KEY, v INT);
+            INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+        ",
+        );
+        e.checkpoint().unwrap();
+        run_all(
+            &mut e,
+            "
+            UPDATE t SET v = v + 100 WHERE id <= 2;
+            DELETE FROM t WHERE id = 3;
+        ",
+        );
+        std::mem::forget(e);
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT id, v FROM t ORDER BY id");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], Value::Integer(1));
+                assert_eq!(rows[0][1], Value::Integer(110));
+                assert_eq!(rows[1][0], Value::Integer(2));
+                assert_eq!(rows[1][1], Value::Integer(120));
             }
             _ => panic!(),
         }
@@ -443,6 +525,63 @@ fn corrupted_page_header_returns_error_instead_of_panicking() {
         Err(e) => e.to_string(),
     };
     assert!(err.contains("invalid page slot count"), "{err}");
+    cleanup(&path);
+}
+
+#[test]
+fn corrupted_super_page_count_returns_error() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        e.checkpoint().unwrap();
+    }
+
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(SeekFrom::Start((HEADER_SIZE + 12) as u64)).unwrap();
+    f.write_all(&0u64.to_le_bytes()).unwrap();
+    f.sync_data().unwrap();
+
+    let err = match DiskEngine::open(&path) {
+        Ok(_) => panic!("corrupted database opened successfully"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("page_count is zero"), "{err}");
+    cleanup(&path);
+}
+
+#[test]
+fn corrupted_catalog_cycle_returns_error() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(&mut e, "CREATE TABLE t (id INT PRIMARY KEY)");
+        e.checkpoint().unwrap();
+    }
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut root = [0; 8];
+    f.seek(SeekFrom::Start((HEADER_SIZE + 28) as u64)).unwrap();
+    f.read_exact(&mut root).unwrap();
+    let root = u64::from_le_bytes(root);
+    assert_ne!(root, 0);
+    f.seek(SeekFrom::Start(root * PAGE_SIZE as u64 + 12))
+        .unwrap();
+    f.write_all(&root.to_le_bytes()).unwrap();
+    f.sync_data().unwrap();
+
+    let err = match DiskEngine::open(&path) {
+        Ok(_) => panic!("corrupted database opened successfully"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("catalog page chain contains a cycle"), "{err}");
     cleanup(&path);
 }
 

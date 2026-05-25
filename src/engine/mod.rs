@@ -67,6 +67,12 @@ pub trait Engine {
     /// reported before the old row is changed; later I/O failures are
     /// storage-engine specific and may require WAL recovery.
     fn update(&mut self, table: &str, id: RowId, row: Row) -> Result<()>;
+    fn delete_batch(&mut self, table: &str, ids: &[RowId]) -> Result<()> {
+        for id in ids {
+            self.delete(table, *id)?;
+        }
+        Ok(())
+    }
     fn delete(&mut self, table: &str, id: RowId) -> Result<()>;
     fn get(&mut self, table: &str, id: RowId) -> Result<Option<Row>>;
     fn lookup_index(

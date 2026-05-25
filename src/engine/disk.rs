@@ -286,38 +286,50 @@ impl Engine for DiskEngine {
         let table_def = self.catalog.get(table)?.clone();
         let validated = validate_update_rows(&table_def, updates)?;
         check_unique_updates_disk(&mut self.pager, &self.table_heads, &table_def, &validated)?;
-        preflight_update_pages(&mut self.pager, &validated)?;
-        for (id, row) in validated {
-            self.update_unchecked(table, &table_def, id, row)?;
+        let plan = plan_update_pages(&mut self.pager, &validated)?;
+        self.wal.append(&LogRecord::UpdateBatch {
+            table: table.to_string(),
+            rows: validated.clone(),
+        })?;
+        for (page_id, page) in plan.pages {
+            self.pager.write_page(page_id, page)?;
+        }
+        self.pager.flush()?;
+        for (id, old_row, new_row) in plan.changed {
+            for index in &table_def.indexes {
+                let col_idx = table_def.column_index(&index.column)?;
+                self.indexes.remove(&index.name, &old_row.0[col_idx], id);
+                self.indexes.insert(&index.name, &new_row.0[col_idx], id);
+            }
         }
         Ok(())
     }
 
-    fn delete(&mut self, table: &str, id: RowId) -> Result<()> {
+    fn delete_batch(&mut self, table: &str, ids: &[RowId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let table_def = self.catalog.get(table)?.clone();
-        let (page_id, slot) = split_row_id(id);
-        let mut page = self.pager.read_page(page_id)?;
-        let old_row = match page.get(slot) {
-            Some(bytes) => {
-                let mut s = bytes;
-                Some(decode_row(&mut s)?)
-            }
-            None => None,
-        };
-        page.delete(slot)?;
-        self.wal.append(&LogRecord::Delete {
+        let plan = plan_delete_pages(&mut self.pager, ids)?;
+        self.wal.append(&LogRecord::DeleteBatch {
             table: table.to_string(),
-            id,
+            ids: ids.to_vec(),
         })?;
-        self.pager.write_page(page_id, page)?;
+        for (page_id, page) in plan.pages {
+            self.pager.write_page(page_id, page)?;
+        }
         self.pager.flush()?;
-        if let Some(old_row) = old_row {
+        for (id, old_row) in plan.deleted {
             for index in &table_def.indexes {
                 let col_idx = table_def.column_index(&index.column)?;
                 self.indexes.remove(&index.name, &old_row.0[col_idx], id);
             }
         }
         Ok(())
+    }
+
+    fn delete(&mut self, table: &str, id: RowId) -> Result<()> {
+        self.delete_batch(table, &[id])
     }
 
     fn get(&mut self, table: &str, id: RowId) -> Result<Option<Row>> {
@@ -463,6 +475,16 @@ struct InsertPlan {
     head: PageId,
 }
 
+struct UpdatePlan {
+    changed: Vec<(RowId, Row, Row)>,
+    pages: HashMap<PageId, Page>,
+}
+
+struct DeletePlan {
+    deleted: Vec<(RowId, Row)>,
+    pages: HashMap<PageId, Page>,
+}
+
 fn plan_insert_pages(
     pager: &mut Pager,
     heads: &HashMap<String, PageId>,
@@ -524,7 +546,12 @@ fn plan_insert_pages(
 }
 
 fn preflight_update_pages(pager: &mut Pager, updates: &[(RowId, Row)]) -> Result<()> {
+    plan_update_pages(pager, updates).map(|_| ())
+}
+
+fn plan_update_pages(pager: &mut Pager, updates: &[(RowId, Row)]) -> Result<UpdatePlan> {
     let mut pages = HashMap::new();
+    let mut changed = Vec::with_capacity(updates.len());
     for (id, row) in updates {
         let (page_id, slot) = split_row_id(*id);
         let page = match pages.entry(page_id) {
@@ -533,11 +560,43 @@ fn preflight_update_pages(pager: &mut Pager, updates: &[(RowId, Row)]) -> Result
                 entry.insert(pager.read_page(page_id)?)
             }
         };
+        let old_row = match page.get(slot) {
+            Some(bytes) => {
+                let mut s = bytes;
+                decode_row(&mut s)?
+            }
+            None => {
+                return Err(Error::internal(format!(
+                    "update target row {id} no longer exists"
+                )));
+            }
+        };
         let mut buf = Vec::new();
         encode_row(row, &mut buf);
         page.update(slot, &buf)?;
+        changed.push((*id, old_row, row.clone()));
     }
-    Ok(())
+    Ok(UpdatePlan { changed, pages })
+}
+
+fn plan_delete_pages(pager: &mut Pager, ids: &[RowId]) -> Result<DeletePlan> {
+    let mut pages = HashMap::new();
+    let mut deleted = Vec::new();
+    for id in ids {
+        let (page_id, slot) = split_row_id(*id);
+        let page = match pages.entry(page_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(pager.read_page(page_id)?)
+            }
+        };
+        if let Some(bytes) = page.get(slot) {
+            let mut s = bytes;
+            deleted.push((*id, decode_row(&mut s)?));
+        }
+        page.delete(slot)?;
+    }
+    Ok(DeletePlan { deleted, pages })
 }
 
 fn check_unique_disk(
@@ -738,7 +797,13 @@ fn read_catalog(pager: &mut Pager) -> Result<(Catalog, std::collections::HashMap
     let mut catalog = Catalog::new();
     let mut heads = std::collections::HashMap::new();
     let mut cur = pager.catalog_root();
+    let mut seen = HashSet::new();
     while cur != 0 {
+        if !seen.insert(cur) {
+            return Err(Error::other(format!(
+                "catalog page chain contains a cycle at page {cur}"
+            )));
+        }
         let page = pager.read_page(cur)?;
         for (_slot, bytes) in page.iter() {
             let mut s = bytes;
@@ -826,7 +891,13 @@ fn build_catalog_chain(
 
 fn free_catalog_chain(pager: &mut Pager, root: PageId) -> Result<()> {
     let mut cur = root;
+    let mut seen = HashSet::new();
     while cur != 0 {
+        if !seen.insert(cur) {
+            return Err(Error::other(format!(
+                "catalog page chain contains a cycle at page {cur}"
+            )));
+        }
         let p = pager.read_page(cur)?;
         let next = p.next_page();
         pager.deallocate(cur)?;
@@ -974,6 +1045,25 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 page.update(slot, &buf)?;
                 pager.write_page(page_id, page)?;
             }
+            LogRecord::UpdateBatch { table, rows } => {
+                if !catalog.contains(table) {
+                    continue;
+                }
+                for (id, row) in rows {
+                    let (page_id, slot) = split_row_id(*id);
+                    let mut buf = Vec::new();
+                    encode_row(row, &mut buf);
+                    let mut page = pager.read_page(page_id)?;
+                    if page.get(slot) == Some(buf.as_slice()) {
+                        continue;
+                    }
+                    if has_later_record_for_row(&recs, idx, table, *id) {
+                        continue;
+                    }
+                    page.update(slot, &buf)?;
+                    pager.write_page(page_id, page)?;
+                }
+            }
             LogRecord::Delete { table, id } => {
                 if !catalog.contains(table) {
                     continue;
@@ -985,6 +1075,20 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 }
                 page.delete(slot)?;
                 pager.write_page(page_id, page)?;
+            }
+            LogRecord::DeleteBatch { table, ids } => {
+                if !catalog.contains(table) {
+                    continue;
+                }
+                for id in ids {
+                    let (page_id, slot) = split_row_id(*id);
+                    let mut page = pager.read_page(page_id)?;
+                    if page.get(slot).is_none() {
+                        continue;
+                    }
+                    page.delete(slot)?;
+                    pager.write_page(page_id, page)?;
+                }
             }
         }
     }
@@ -1014,6 +1118,14 @@ fn has_later_record_for_row(recs: &[LogRecord], idx: usize, table: &str, id: Row
             table: later_table,
             rows,
         } => later_table == table && rows.iter().any(|(later_id, _)| *later_id == id),
+        LogRecord::UpdateBatch {
+            table: later_table,
+            rows,
+        } => later_table == table && rows.iter().any(|(later_id, _)| *later_id == id),
+        LogRecord::DeleteBatch {
+            table: later_table,
+            ids,
+        } => later_table == table && ids.contains(&id),
         LogRecord::DropTable(name) => name == table,
         LogRecord::DropTablePages { table: name, .. } => name == table,
         LogRecord::CreateTable(_) | LogRecord::CreateIndex(_) | LogRecord::DropIndex(_) => false,

@@ -44,8 +44,15 @@ pub enum LogRecord {
     },
     /// `UPDATE` of an existing row.
     Update { table: String, id: RowId, row: Row },
+    /// Batch UPDATE committed as one statement.
+    UpdateBatch {
+        table: String,
+        rows: Vec<(RowId, Row)>,
+    },
     /// `DELETE` by row id.
     Delete { table: String, id: RowId },
+    /// Batch DELETE committed as one statement.
+    DeleteBatch { table: String, ids: Vec<RowId> },
 }
 
 pub struct Wal {
@@ -192,10 +199,31 @@ fn encode_record(rec: &LogRecord, out: &mut Vec<u8>) -> Result<()> {
             out.extend_from_slice(&id.to_le_bytes());
             encode_row(row, out);
         }
+        LogRecord::UpdateBatch { table, rows } => {
+            out.push(10);
+            encode_string(table, out);
+            out.extend_from_slice(
+                &checked_len_u32(rows.len(), "update batch row count")?.to_le_bytes(),
+            );
+            for (id, row) in rows {
+                out.extend_from_slice(&id.to_le_bytes());
+                encode_row(row, out);
+            }
+        }
         LogRecord::Delete { table, id } => {
             out.push(5);
             encode_string(table, out);
             out.extend_from_slice(&id.to_le_bytes());
+        }
+        LogRecord::DeleteBatch { table, ids } => {
+            out.push(11);
+            encode_string(table, out);
+            out.extend_from_slice(
+                &checked_len_u32(ids.len(), "delete batch row count")?.to_le_bytes(),
+            );
+            for id in ids {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
         }
     }
     Ok(())
@@ -240,10 +268,28 @@ fn decode_record(r: &mut &[u8]) -> Result<LogRecord> {
             id: take_u64(r)?,
             row: decode_row(r)?,
         },
+        10 => {
+            let table = decode_string(r)?;
+            let count = take_u32(r)? as usize;
+            let mut rows = Vec::with_capacity(count);
+            for _ in 0..count {
+                rows.push((take_u64(r)?, decode_row(r)?));
+            }
+            LogRecord::UpdateBatch { table, rows }
+        }
         5 => LogRecord::Delete {
             table: decode_string(r)?,
             id: take_u64(r)?,
         },
+        11 => {
+            let table = decode_string(r)?;
+            let count = take_u32(r)? as usize;
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                ids.push(take_u64(r)?);
+            }
+            LogRecord::DeleteBatch { table, ids }
+        }
         other => return Err(Error::other(format!("WAL: unknown record tag {other}"))),
     })
 }
@@ -389,19 +435,46 @@ mod tests {
                 row: Row(vec![Value::Integer(100)]),
             })
             .unwrap();
+            w.append(&LogRecord::UpdateBatch {
+                table: "t".into(),
+                rows: vec![
+                    (8, Row(vec![Value::Integer(101)])),
+                    (9, Row(vec![Value::Integer(102)])),
+                ],
+            })
+            .unwrap();
             w.append(&LogRecord::Delete {
                 table: "t".into(),
                 id: 7,
             })
             .unwrap();
+            w.append(&LogRecord::DeleteBatch {
+                table: "t".into(),
+                ids: vec![8, 9],
+            })
+            .unwrap();
         }
         let mut w = Wal::open(&path).unwrap();
         let recs = w.replay().unwrap();
-        assert_eq!(recs.len(), 4);
+        assert_eq!(recs.len(), 6);
         match &recs[1] {
             LogRecord::InsertBatch { table, rows } => {
                 assert_eq!(table, "t");
                 assert_eq!(rows.len(), 2);
+            }
+            _ => panic!(),
+        }
+        match &recs[3] {
+            LogRecord::UpdateBatch { table, rows } => {
+                assert_eq!(table, "t");
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!(),
+        }
+        match &recs[5] {
+            LogRecord::DeleteBatch { table, ids } => {
+                assert_eq!(table, "t");
+                assert_eq!(ids, &[8, 9]);
             }
             _ => panic!(),
         }

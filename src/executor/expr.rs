@@ -435,6 +435,15 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
             "aggregate `{name}` reached scalar evaluator"
         )));
     }
+    if upper == "COALESCE" {
+        for arg in args {
+            let value = eval_with(arg, r)?;
+            if !value.is_null() {
+                return Ok(value);
+            }
+        }
+        return Ok(Value::Null);
+    }
     // Most builtins propagate NULL — evaluate args once and short-circuit.
     let evaled: Vec<Value> = args
         .iter()
@@ -524,14 +533,6 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
                 out.push_str(&v.to_string());
             }
             Ok(Value::String(out))
-        }
-        "COALESCE" => {
-            for v in &evaled {
-                if !v.is_null() {
-                    return Ok(v.clone());
-                }
-            }
-            Ok(Value::Null)
         }
         "NULLIF" => {
             check_arity(name, 2, &evaled)?;
@@ -903,6 +904,7 @@ mod tests {
         assert_eq!(ev("COALESCE(NULL, NULL, 3)"), Value::Integer(3));
         assert_eq!(ev("COALESCE(NULL, NULL, NULL)"), Value::Null);
         assert_eq!(ev("COALESCE(1, 2)"), Value::Integer(1));
+        assert_eq!(ev("COALESCE(1, 1 / 0)"), Value::Integer(1));
     }
 
     #[test]

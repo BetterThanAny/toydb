@@ -1000,9 +1000,7 @@ impl<'a> Executor<'a> {
             }
         }
         let count = victims.len();
-        for id in victims {
-            self.engine.delete(&d.table, id)?;
-        }
+        self.engine.delete_batch(&d.table, &victims)?;
         Ok(ResultSet::Delete { count })
     }
 }
@@ -1983,6 +1981,11 @@ fn describe_plan(engine: &dyn Engine, stmt: &Statement) -> Result<String> {
 }
 
 fn describe_select(engine: &dyn Engine, s: &SelectStmt) -> Result<String> {
+    if !s.unions.is_empty() && (!s.order_by.is_empty() || s.limit.is_some() || s.offset.is_some()) {
+        return Err(Error::other(
+            "ORDER BY / LIMIT / OFFSET on a UNION'ed result is not supported yet",
+        ));
+    }
     let mut lines: Vec<String> = Vec::new();
     match &s.from {
         None => lines.push("Const".into()),

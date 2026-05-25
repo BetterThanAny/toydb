@@ -108,8 +108,8 @@ impl Value {
             (Null, _) | (_, Null) => None,
             (Boolean(a), Boolean(b)) => Some(a.cmp(b)),
             (Integer(a), Integer(b)) => Some(a.cmp(b)),
-            (Integer(a), Float(b)) => (*a as f64).partial_cmp(b),
-            (Float(a), Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (Integer(a), Float(b)) => partial_cmp_i64_f64(*a, *b),
+            (Float(a), Integer(b)) => partial_cmp_i64_f64(*b, *a).map(Ordering::reverse),
             (Float(a), Float(b)) => a.partial_cmp(b),
             (String(a), String(b)) => Some(a.cmp(b)),
             (a, b) => {
@@ -142,8 +142,8 @@ impl Value {
             (_, Null) => Ordering::Greater,
             (Boolean(a), Boolean(b)) => a.cmp(b),
             (Integer(a), Integer(b)) => a.cmp(b),
-            (Integer(a), Float(b)) => (*a as f64).total_cmp(b),
-            (Float(a), Integer(b)) => a.total_cmp(&(*b as f64)),
+            (Integer(a), Float(b)) => total_cmp_i64_f64(*a, *b),
+            (Float(a), Integer(b)) => total_cmp_i64_f64(*b, *a).reverse(),
             (Float(a), Float(b)) => a.total_cmp(b),
             (String(a), String(b)) => a.cmp(b),
             (a, b) => a.tag().cmp(&b.tag()),
@@ -170,6 +170,43 @@ impl Value {
             Value::String(_) => "STRING",
         }
     }
+}
+
+fn partial_cmp_i64_f64(i: i64, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if f == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    if f >= 9223372036854775808.0_f64 {
+        return Some(Ordering::Less);
+    }
+    if f < i64::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+
+    let trunc = f.trunc() as i64;
+    match i.cmp(&trunc) {
+        Ordering::Less => Some(Ordering::Less),
+        Ordering::Greater => Some(Ordering::Greater),
+        Ordering::Equal => {
+            if f.fract() > 0.0 {
+                Some(Ordering::Less)
+            } else if f.fract() < 0.0 {
+                Some(Ordering::Greater)
+            } else {
+                Some(Ordering::Equal)
+            }
+        }
+    }
+}
+
+fn total_cmp_i64_f64(i: i64, f: f64) -> Ordering {
+    partial_cmp_i64_f64(i, f).unwrap_or_else(|| (i as f64).total_cmp(&f))
 }
 
 impl fmt::Display for Value {
@@ -335,6 +372,16 @@ mod tests {
         let b = Value::Float(5.5);
         assert_eq!(a.partial_cmp_sql(&b).unwrap(), Some(Ordering::Less));
         assert_eq!(b.partial_cmp_sql(&a).unwrap(), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn cmp_large_int_vs_float_is_exact() {
+        let a = Value::Integer(9_007_199_254_740_993);
+        let b = Value::Float(9_007_199_254_740_992.0);
+        assert_eq!(a.partial_cmp_sql(&b).unwrap(), Some(Ordering::Greater));
+        assert_eq!(b.partial_cmp_sql(&a).unwrap(), Some(Ordering::Less));
+        assert_eq!(a.total_cmp(&b), Ordering::Greater);
+        assert_eq!(b.total_cmp(&a), Ordering::Less);
     }
 
     #[test]

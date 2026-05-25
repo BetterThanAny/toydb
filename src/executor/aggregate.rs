@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
 use crate::executor::expr::{Resolver, eval_with};
-use crate::sql::ast::{Expression, Literal};
+use crate::sql::ast::{BinaryOp, Expression, Literal};
 use crate::types::value::Value;
 
 /// A canonical key for an aggregate expression. We use the original
@@ -404,6 +404,12 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
         }
         Expression::Binary(l, op, r) => {
             let lv = eval_in_group(l, aggs, finals, outer)?;
+            if *op == BinaryOp::And && matches!(lv, Value::Boolean(false)) {
+                return Ok(Value::Boolean(false));
+            }
+            if *op == BinaryOp::Or && matches!(lv, Value::Boolean(true)) {
+                return Ok(Value::Boolean(true));
+            }
             let rv = eval_in_group(r, aggs, finals, outer)?;
             eval_with(
                 &Expression::Binary(
@@ -510,6 +516,15 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
             args,
             distinct,
         } => {
+            if name.eq_ignore_ascii_case("COALESCE") {
+                for arg in args {
+                    let value = eval_in_group(arg, aggs, finals, outer)?;
+                    if !value.is_null() {
+                        return Ok(value);
+                    }
+                }
+                return Ok(Value::Null);
+            }
             let new_args: Vec<Expression> = args
                 .iter()
                 .map(|a| eval_in_group(a, aggs, finals, outer).map(literal_to_expr))

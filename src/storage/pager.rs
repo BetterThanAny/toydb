@@ -353,6 +353,21 @@ impl Pager {
         self.page_count = read_u64(&buf, SUPER_PAGE_COUNT_OFF);
         self.free_head = read_u64(&buf, SUPER_FREE_HEAD_OFF);
         self.catalog_root = read_u64(&buf, SUPER_CATALOG_ROOT_OFF);
+        if self.page_count == 0 {
+            return Err(Error::other("invalid super page: page_count is zero"));
+        }
+        let expected_len = self
+            .page_count
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| Error::other("invalid super page: page_count overflows file size"))?;
+        let actual_len = self.file.metadata()?.len();
+        if actual_len < expected_len {
+            return Err(Error::other(format!(
+                "database file is truncated: super page advertises {expected_len} bytes, file has {actual_len}"
+            )));
+        }
+        validate_page_ref(self.free_head, self.page_count, "free list head")?;
+        validate_page_ref(self.catalog_root, self.page_count, "catalog root")?;
         let page = Page::from_bytes(buf);
         self.cache
             .insert(SUPER_PAGE, CacheEntry { page, dirty: false });
@@ -387,6 +402,15 @@ fn read_u32(buf: &[u8], off: usize) -> u32 {
 }
 fn read_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+fn validate_page_ref(id: PageId, page_count: u64, label: &str) -> Result<()> {
+    if id != 0 && id >= page_count {
+        return Err(Error::other(format!(
+            "invalid super page: {label} page {id} is outside page_count {page_count}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

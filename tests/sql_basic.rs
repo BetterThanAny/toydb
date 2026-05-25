@@ -421,6 +421,36 @@ fn mixed_union_and_union_all_is_left_associative() {
 }
 
 #[test]
+fn union_distinguishes_large_int_from_rounded_float() {
+    let mut e = MemoryEngine::new();
+    let r = run(
+        &mut e,
+        "SELECT 9007199254740993 UNION SELECT 9007199254740992.0",
+    );
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows.iter()
+                    .any(|row| row[0] == Value::Float(9_007_199_254_740_992.0))
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row[0] == Value::Integer(9_007_199_254_740_993))
+            );
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn explain_rejects_unsupported_union_order_by() {
+    let mut e = MemoryEngine::new();
+    let err = try_run(&mut e, "EXPLAIN SELECT 1 UNION SELECT 2 ORDER BY 1").unwrap_err();
+    assert!(err.contains("not supported"), "{err}");
+}
+
+#[test]
 fn group_by_can_order_by_aggregate_not_in_select() {
     let mut e = MemoryEngine::new();
     run_all(
@@ -463,6 +493,29 @@ fn group_by_can_having_on_select_alias() {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][0], Value::Integer(1));
             assert_eq!(rows[0][1], Value::Integer(30));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn grouped_having_short_circuits_boolean_ops() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT);
+        INSERT INTO t VALUES (1);
+    ",
+    );
+    let r = run(
+        &mut e,
+        "SELECT COUNT(*) FROM t HAVING COUNT(*) = 1 OR 1 / 0 = 1",
+    );
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(1));
         }
         _ => panic!(),
     }
