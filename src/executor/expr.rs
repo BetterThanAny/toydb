@@ -70,6 +70,7 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
                 BinaryOp::And => {
                     let lv = eval_with(l, r)?;
                     if matches!(lv, Value::Boolean(false)) {
+                        validate_short_circuit_boolean_operand(rhs, r, "AND")?;
                         return Ok(Value::Boolean(false));
                     }
                     let rv = eval_with(rhs, r)?;
@@ -78,6 +79,7 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
                 BinaryOp::Or => {
                     let lv = eval_with(l, r)?;
                     if matches!(lv, Value::Boolean(true)) {
+                        validate_short_circuit_boolean_operand(rhs, r, "OR")?;
                         return Ok(Value::Boolean(true));
                     }
                     let rv = eval_with(rhs, r)?;
@@ -423,6 +425,204 @@ fn logical_operand(op: &str, value: &Value) -> Result<Option<bool>> {
             other.type_name()
         ))),
     }
+}
+
+pub(crate) fn validate_short_circuit_boolean_operand<R: Resolver + ?Sized>(
+    expr: &Expression,
+    r: &R,
+    op: &str,
+) -> Result<()> {
+    match infer_expr_kind(expr, r)? {
+        ExprKind::Boolean | ExprKind::Null | ExprKind::Unknown => Ok(()),
+        other => Err(Error::ty(format!(
+            "{op} requires boolean operands, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExprKind {
+    Null,
+    Boolean,
+    Integer,
+    Float,
+    String,
+    Unknown,
+}
+
+impl ExprKind {
+    fn from_value(value: Value) -> Self {
+        match value {
+            Value::Null => ExprKind::Null,
+            Value::Boolean(_) => ExprKind::Boolean,
+            Value::Integer(_) => ExprKind::Integer,
+            Value::Float(_) => ExprKind::Float,
+            Value::String(_) => ExprKind::String,
+        }
+    }
+
+    fn type_name(self) -> &'static str {
+        match self {
+            ExprKind::Null => "NULL",
+            ExprKind::Boolean => "BOOLEAN",
+            ExprKind::Integer => "INTEGER",
+            ExprKind::Float => "FLOAT",
+            ExprKind::String => "STRING",
+            ExprKind::Unknown => "UNKNOWN",
+        }
+    }
+
+    fn is_numeric(self) -> bool {
+        matches!(self, ExprKind::Integer | ExprKind::Float)
+    }
+}
+
+fn infer_expr_kind<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<ExprKind> {
+    Ok(match expr {
+        Expression::Literal(lit) => ExprKind::from_value(literal_value(lit)),
+        Expression::Column(name) => ExprKind::from_value(r.column(name)?),
+        Expression::Qualified(table, name) => ExprKind::from_value(r.qualified(table, name)?),
+        Expression::Wildcard => return Err(Error::internal("`*` cannot appear here")),
+        Expression::Unary(UnaryOp::Not, inner) => {
+            validate_short_circuit_boolean_operand(inner, r, "NOT")?;
+            ExprKind::Boolean
+        }
+        Expression::Unary(UnaryOp::Plus | UnaryOp::Minus, inner) => {
+            let kind = infer_expr_kind(inner, r)?;
+            match kind {
+                ExprKind::Null | ExprKind::Unknown => ExprKind::Unknown,
+                ExprKind::Integer | ExprKind::Float => kind,
+                other => {
+                    return Err(Error::ty(format!(
+                        "cannot apply numeric unary operator to {}",
+                        other.type_name()
+                    )));
+                }
+            }
+        }
+        Expression::Binary(left, BinaryOp::And, right) => {
+            validate_short_circuit_boolean_operand(left, r, "AND")?;
+            validate_short_circuit_boolean_operand(right, r, "AND")?;
+            ExprKind::Boolean
+        }
+        Expression::Binary(left, BinaryOp::Or, right) => {
+            validate_short_circuit_boolean_operand(left, r, "OR")?;
+            validate_short_circuit_boolean_operand(right, r, "OR")?;
+            ExprKind::Boolean
+        }
+        Expression::Binary(
+            left,
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq,
+            right,
+        ) => {
+            let left_kind = infer_expr_kind(left, r)?;
+            let right_kind = infer_expr_kind(right, r)?;
+            if !comparison_kinds_compatible(left_kind, right_kind) {
+                return Err(Error::ty(format!(
+                    "cannot compare {} with {}",
+                    left_kind.type_name(),
+                    right_kind.type_name()
+                )));
+            }
+            ExprKind::Boolean
+        }
+        Expression::Binary(left, BinaryOp::Concat, right) => {
+            infer_expr_kind(left, r)?;
+            infer_expr_kind(right, r)?;
+            ExprKind::String
+        }
+        Expression::Binary(left, _, right) => {
+            let left_kind = infer_expr_kind(left, r)?;
+            let right_kind = infer_expr_kind(right, r)?;
+            match (left_kind, right_kind) {
+                (ExprKind::Null, _) | (_, ExprKind::Null) => ExprKind::Null,
+                (l, r) if l.is_numeric() && r.is_numeric() => {
+                    if l == ExprKind::Float || r == ExprKind::Float {
+                        ExprKind::Float
+                    } else {
+                        ExprKind::Integer
+                    }
+                }
+                (ExprKind::Unknown, _) | (_, ExprKind::Unknown) => ExprKind::Unknown,
+                (l, r) => {
+                    return Err(Error::ty(format!(
+                        "operator does not apply to {} and {}",
+                        l.type_name(),
+                        r.type_name()
+                    )));
+                }
+            }
+        }
+        Expression::IsNull { expr, .. } => {
+            infer_expr_kind(expr, r)?;
+            ExprKind::Boolean
+        }
+        Expression::InList { expr, list, .. } => {
+            infer_expr_kind(expr, r)?;
+            for item in list {
+                infer_expr_kind(item, r)?;
+            }
+            ExprKind::Boolean
+        }
+        Expression::Between {
+            expr, low, high, ..
+        } => {
+            infer_expr_kind(expr, r)?;
+            infer_expr_kind(low, r)?;
+            infer_expr_kind(high, r)?;
+            ExprKind::Boolean
+        }
+        Expression::Like { expr, pattern, .. } => {
+            infer_expr_kind(expr, r)?;
+            infer_expr_kind(pattern, r)?;
+            ExprKind::Boolean
+        }
+        Expression::Function { args, .. } => {
+            for arg in args {
+                infer_expr_kind(arg, r)?;
+            }
+            ExprKind::Unknown
+        }
+        Expression::Scalar(_) => {
+            return Err(Error::internal(
+                "scalar subqueries must be resolved before eval (executor bug)",
+            ));
+        }
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(op) = operand {
+                infer_expr_kind(op, r)?;
+            }
+            for (when, then) in branches {
+                if operand.is_none() {
+                    validate_short_circuit_boolean_operand(when, r, "CASE WHEN")?;
+                } else {
+                    infer_expr_kind(when, r)?;
+                }
+                infer_expr_kind(then, r)?;
+            }
+            if let Some(otherwise) = otherwise {
+                infer_expr_kind(otherwise, r)?;
+            }
+            ExprKind::Unknown
+        }
+    })
+}
+
+fn comparison_kinds_compatible(left: ExprKind, right: ExprKind) -> bool {
+    matches!(left, ExprKind::Null | ExprKind::Unknown)
+        || matches!(right, ExprKind::Null | ExprKind::Unknown)
+        || left == right
+        || (left.is_numeric() && right.is_numeric())
 }
 
 fn numeric(v: &Value) -> bool {

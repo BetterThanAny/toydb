@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
-use crate::executor::expr::{Resolver, eval_with};
+use crate::executor::expr::{Resolver, eval_with, validate_short_circuit_boolean_operand};
 use crate::sql::ast::{BinaryOp, Expression, Literal};
 use crate::types::value::Value;
 
@@ -405,9 +405,11 @@ pub fn eval_in_group<R: Resolver + ?Sized>(
         Expression::Binary(l, op, r) => {
             let lv = eval_in_group(l, aggs, finals, outer)?;
             if *op == BinaryOp::And && matches!(lv, Value::Boolean(false)) {
+                validate_short_circuit_boolean_operand(r, outer, "AND")?;
                 return Ok(Value::Boolean(false));
             }
             if *op == BinaryOp::Or && matches!(lv, Value::Boolean(true)) {
+                validate_short_circuit_boolean_operand(r, outer, "OR")?;
                 return Ok(Value::Boolean(true));
             }
             let rv = eval_in_group(r, aggs, finals, outer)?;

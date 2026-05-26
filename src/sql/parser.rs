@@ -827,6 +827,12 @@ impl Parser {
             }
             Some(Token::Minus) => {
                 self.bump();
+                if let Some(Token::Number(s)) = self.peek_tok()
+                    && s == "9223372036854775808"
+                {
+                    self.bump();
+                    return Ok(Expression::Literal(Literal::Integer(i64::MIN)));
+                }
                 let e = self.parse_unary()?;
                 Ok(Expression::Unary(UnaryOp::Minus, Box::new(e)))
             }

@@ -522,6 +522,27 @@ fn grouped_having_short_circuits_boolean_ops() {
 }
 
 #[test]
+fn short_circuit_still_validates_boolean_operands_and_columns() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT);
+        INSERT INTO t VALUES (1);
+    ",
+    );
+
+    let err = try_run(&mut e, "SELECT FALSE AND 1").unwrap_err();
+    assert!(err.contains("requires boolean"), "{err}");
+
+    let err = try_run(&mut e, "SELECT COUNT(*) FROM t WHERE TRUE OR missing = 1").unwrap_err();
+    assert!(err.contains("no such column `missing`"), "{err}");
+
+    let err = try_run(&mut e, "SELECT COUNT(*) FROM t HAVING COUNT(*) = 1 OR 1").unwrap_err();
+    assert!(err.contains("requires boolean"), "{err}");
+}
+
+#[test]
 fn having_without_group_or_aggregate_is_rejected() {
     let mut e = MemoryEngine::new();
     run_all(
@@ -585,6 +606,32 @@ fn correlated_scalar_subquery_is_rejected_explicitly() {
 }
 
 #[test]
+fn scalar_subquery_in_join_on_is_resolved() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE a (id INT);
+        CREATE TABLE b (id INT);
+        INSERT INTO a VALUES (1);
+        INSERT INTO b VALUES (1);
+    ",
+    );
+    let r = run(
+        &mut e,
+        "SELECT a.id, b.id FROM a JOIN b ON b.id = (SELECT 1)",
+    );
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(1));
+            assert_eq!(rows[0][1], Value::Integer(1));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn self_join_without_unique_alias_is_rejected() {
     let mut e = MemoryEngine::new();
     run_all(
@@ -644,6 +691,43 @@ fn limit_null_is_unbounded() {
         ResultSet::Select { rows, .. } => {
             assert_eq!(rows.len(), 3);
             assert_eq!(rows[2][0], Value::Integer(3));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn grouped_expression_can_be_wrapped_in_unary_operator() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (a INT);
+        INSERT INTO t VALUES (1), (2);
+    ",
+    );
+    let r = run(
+        &mut e,
+        "SELECT -(a + 1) AS neg FROM t GROUP BY a + 1 ORDER BY neg",
+    );
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::Integer(-3));
+            assert_eq!(rows[1][0], Value::Integer(-2));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn min_i64_literal_parses_with_unary_minus() {
+    let mut e = MemoryEngine::new();
+    let r = run(&mut e, "SELECT -9223372036854775808");
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(i64::MIN));
         }
         _ => panic!(),
     }

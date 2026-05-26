@@ -127,6 +127,9 @@ impl<'a> Executor<'a> {
                 self.resolve_subqueries_expr(expr)?;
             }
         }
+        if let Some(from) = s.from.as_mut() {
+            self.resolve_subqueries_from(from)?;
+        }
         if let Some(w) = s.r#where.as_mut() {
             self.resolve_subqueries_expr(w)?;
         }
@@ -149,6 +152,19 @@ impl<'a> Executor<'a> {
             self.resolve_subqueries_select(&mut u.query)?;
         }
         Ok(())
+    }
+
+    fn resolve_subqueries_from(&mut self, from: &mut FromClause) -> Result<()> {
+        match from {
+            FromClause::Table { .. } => Ok(()),
+            FromClause::Join {
+                left, right, on, ..
+            } => {
+                self.resolve_subqueries_from(left)?;
+                self.resolve_subqueries_from(right)?;
+                self.resolve_subqueries_expr(on)
+            }
+        }
     }
 
     fn resolve_subqueries_expr(&mut self, e: &mut Expression) -> Result<()> {
@@ -1805,7 +1821,7 @@ fn validate_grouped_expr_inner(
                 )))
             }
         }
-        Expression::Unary(_, inner) => validate_grouped_expr_inner(inner, group_by, false),
+        Expression::Unary(_, inner) => validate_grouped_expr_inner(inner, group_by, true),
         Expression::Binary(l, _, r) => {
             validate_grouped_expr_inner(l, group_by, true)?;
             validate_grouped_expr_inner(r, group_by, true)
