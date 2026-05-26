@@ -522,6 +522,69 @@ fn grouped_having_short_circuits_boolean_ops() {
 }
 
 #[test]
+fn having_without_group_or_aggregate_is_rejected() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT);
+        INSERT INTO t VALUES (1), (2);
+    ",
+    );
+    let err = try_run(&mut e, "SELECT id FROM t HAVING id > 1").unwrap_err();
+    assert!(err.contains("GROUP BY"), "{err}");
+}
+
+#[test]
+fn aggregate_const_select_uses_implicit_row() {
+    let mut e = MemoryEngine::new();
+    let r = run(
+        &mut e,
+        "SELECT COUNT(*), COUNT(NULL), SUM(1), AVG(1), MIN(1), MAX(1)",
+    );
+    match r {
+        ResultSet::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Integer(1));
+            assert_eq!(rows[0][1], Value::Integer(0));
+            assert_eq!(rows[0][2], Value::Integer(1));
+            assert_eq!(rows[0][3], Value::Float(1.0));
+            assert_eq!(rows[0][4], Value::Integer(1));
+            assert_eq!(rows[0][5], Value::Integer(1));
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn no_from_having_filters_implicit_group() {
+    let mut e = MemoryEngine::new();
+    let r = run(&mut e, "SELECT COUNT(*) HAVING COUNT(*) = 0");
+    match r {
+        ResultSet::Select { rows, .. } => assert!(rows.is_empty()),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn correlated_scalar_subquery_is_rejected_explicitly() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT, n INT);
+        INSERT INTO t VALUES (1, 10), (2, 20);
+    ",
+    );
+    let err = try_run(
+        &mut e,
+        "SELECT id FROM t outer_t WHERE n = (SELECT n FROM t WHERE id = outer_t.id)",
+    )
+    .unwrap_err();
+    assert!(err.contains("correlated subqueries"), "{err}");
+}
+
+#[test]
 fn self_join_without_unique_alias_is_rejected() {
     let mut e = MemoryEngine::new();
     run_all(

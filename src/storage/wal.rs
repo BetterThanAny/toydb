@@ -1,6 +1,7 @@
 //! Write-ahead log (WAL).
 //!
-//! Format: append-only sequence of `[length: u32 LE][payload bytes]`
+//! Format: append-only sequence of
+//! `[magic: 4 bytes][length: u32 LE][checksum: u32 LE][payload bytes]`
 //! records. The payload is itself versioned with a 1-byte type tag and
 //! follows the layouts in [`LogRecord`].
 //!
@@ -20,6 +21,9 @@ use crate::error::{Error, Result};
 use crate::storage::encoding::{decode_row, decode_table, encode_row, encode_table};
 use crate::storage::page::PageId;
 use crate::types::row::Row;
+
+const FRAME_MAGIC: &[u8; 4] = b"TWL1";
+const FRAME_HEADER_LEN: usize = 12;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogRecord {
@@ -74,8 +78,10 @@ impl Wal {
     pub fn append(&mut self, rec: &LogRecord) -> Result<()> {
         let mut payload = Vec::new();
         encode_record(rec, &mut payload)?;
-        let mut framed = Vec::with_capacity(payload.len() + 4);
+        let mut framed = Vec::with_capacity(payload.len() + FRAME_HEADER_LEN);
+        framed.extend_from_slice(FRAME_MAGIC);
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&checksum(&payload).to_le_bytes());
         framed.extend_from_slice(&payload);
         self.file.write_all(&framed)?;
         self.file.sync_data()?;
@@ -99,9 +105,27 @@ impl Wal {
                 break;
             }
             let frame_start = offset;
-            let len = u32::from_le_bytes(slice[..4].try_into().unwrap()) as usize;
-            slice = &slice[4..];
-            offset += 4;
+            let has_magic = &slice[..4] == FRAME_MAGIC;
+            let (len, expected_checksum, header_len) = if has_magic {
+                if slice.len() < FRAME_HEADER_LEN {
+                    truncate_to = Some(frame_start);
+                    break;
+                }
+                (
+                    u32::from_le_bytes(slice[4..8].try_into().unwrap()) as usize,
+                    Some(u32::from_le_bytes(slice[8..12].try_into().unwrap())),
+                    FRAME_HEADER_LEN,
+                )
+            } else {
+                // Backward-compatible read path for pre-checksum WAL files.
+                (
+                    u32::from_le_bytes(slice[..4].try_into().unwrap()) as usize,
+                    None,
+                    4,
+                )
+            };
+            slice = &slice[header_len..];
+            offset += header_len;
             if slice.len() < len {
                 // Tail-truncated WAL — ignore the partial record. This
                 // matches "torn write" semantics: the last commit either
@@ -112,11 +136,19 @@ impl Wal {
             let payload = &slice[..len];
             slice = &slice[len..];
             offset += len;
-            let mut p = payload;
-            let rec = decode_record(&mut p)?;
-            if !p.is_empty() {
-                return Err(Error::other("WAL: trailing bytes in record payload"));
+            if let Some(expected) = expected_checksum
+                && checksum(payload) != expected
+            {
+                truncate_to = Some(frame_start);
+                break;
             }
+            let rec = match decode_complete_record(payload) {
+                Ok(rec) => rec,
+                Err(_) => {
+                    truncate_to = Some(frame_start);
+                    break;
+                }
+            };
             out.push(rec);
         }
         if let Some(n) = truncate_to {
@@ -140,6 +172,15 @@ impl Wal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn checksum(payload: &[u8]) -> u32 {
+    let mut hash = 0x811C_9DC5u32;
+    for byte in payload {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------
@@ -292,6 +333,15 @@ fn decode_record(r: &mut &[u8]) -> Result<LogRecord> {
         }
         other => return Err(Error::other(format!("WAL: unknown record tag {other}"))),
     })
+}
+
+fn decode_complete_record(payload: &[u8]) -> Result<LogRecord> {
+    let mut p = payload;
+    let rec = decode_record(&mut p)?;
+    if !p.is_empty() {
+        return Err(Error::other("WAL: trailing bytes in record payload"));
+    }
+    Ok(rec)
 }
 
 fn encode_string(s: &str, w: &mut Vec<u8>) {
@@ -538,6 +588,7 @@ mod tests {
             })
             .unwrap();
         }
+        let valid_len = std::fs::metadata(&path).unwrap().len();
         OpenOptions::new()
             .append(true)
             .open(&path)
@@ -547,7 +598,57 @@ mod tests {
         let mut w = Wal::open(&path).unwrap();
         let recs = w.replay().unwrap();
         assert_eq!(recs.len(), 1);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 18);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn corrupt_legacy_tail_is_ignored_and_truncated() {
+        let path = tmppath();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.append(&LogRecord::Delete {
+                table: "t".into(),
+                id: 7,
+            })
+            .unwrap();
+        }
+        let valid_len = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1, 0, 0, 0, 0xff])
+            .unwrap();
+        let mut w = Wal::open(&path).unwrap();
+        let recs = w.replay().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn checksum_mismatch_tail_is_ignored_and_truncated() {
+        let path = tmppath();
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.append(&LogRecord::Delete {
+                table: "t".into(),
+                id: 7,
+            })
+            .unwrap();
+        }
+        let valid_len = std::fs::metadata(&path).unwrap().len();
+        let payload = [5u8];
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(FRAME_MAGIC).unwrap();
+        f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&payload).unwrap();
+        let mut w = Wal::open(&path).unwrap();
+        let recs = w.replay().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
         std::fs::remove_file(&path).ok();
     }
 

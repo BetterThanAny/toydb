@@ -19,7 +19,7 @@ use crate::engine::index::IndexStore;
 use crate::engine::{Engine, RowId};
 use crate::error::{Error, Result};
 use crate::storage::encoding::{decode_row, decode_table, encode_row, encode_table};
-use crate::storage::page::{Page, PageId, PageType};
+use crate::storage::page::{HEADER_SIZE, PAGE_SIZE, Page, PageId, PageType, SLOT_SIZE};
 use crate::storage::pager::Pager;
 use crate::storage::wal::{LogRecord, Wal};
 use crate::types::row::Row;
@@ -160,17 +160,23 @@ impl Engine for DiskEngine {
                 table.name
             )));
         }
-        let mut encoded_check = Vec::new();
-        encode_table(&table, &mut encoded_check)?;
+        validate_catalog_entry_fits(&table)?;
         // Allocate first data page for the table.
         let head = self.pager.allocate(PageType::TableData)?;
+
+        let mut next_catalog = self.catalog.clone();
+        let mut next_heads = self.table_heads.clone();
+        next_catalog.create_table(table.clone())?;
+        next_heads.insert(table.name.clone(), head);
+        validate_catalog_entries_fit(&next_catalog, &next_heads)?;
+
         self.wal.append(&LogRecord::CreateTable(table.clone()))?;
-        self.catalog.create_table(table.clone())?;
+        write_catalog(&mut self.pager, &next_catalog, &next_heads)?;
+        self.catalog = next_catalog;
+        self.table_heads = next_heads;
         for index in &table.indexes {
             self.indexes.rebuild(&index.name, std::iter::empty());
         }
-        self.table_heads.insert(table.name.clone(), head);
-        self.rewrite_catalog()?;
         Ok(())
     }
 
@@ -213,10 +219,15 @@ impl Engine for DiskEngine {
         }
         let table = self.catalog.get(&index.table)?.clone();
         let col_idx = table.column_index(&index.column)?;
-        self.wal.append(&LogRecord::CreateIndex(index.clone()))?;
-        self.catalog.create_index(index.clone())?;
-        self.rewrite_catalog()?;
+
+        let mut next_catalog = self.catalog.clone();
+        next_catalog.create_index(index.clone())?;
+        validate_catalog_entries_fit(&next_catalog, &self.table_heads)?;
         let rows = scan_table_pages(&mut self.pager, &self.table_heads, &index.table)?;
+
+        self.wal.append(&LogRecord::CreateIndex(index.clone()))?;
+        write_catalog(&mut self.pager, &next_catalog, &self.table_heads)?;
+        self.catalog = next_catalog;
         self.indexes.rebuild(
             &index.name,
             rows.into_iter()
@@ -231,9 +242,12 @@ impl Engine for DiskEngine {
             .find_index(name)
             .cloned()
             .ok_or_else(|| Error::schema(format!("index `{name}` does not exist")))?;
+        let mut next_catalog = self.catalog.clone();
+        next_catalog.drop_index(name)?;
+        validate_catalog_entries_fit(&next_catalog, &self.table_heads)?;
         self.wal.append(&LogRecord::DropIndex(name.to_string()))?;
-        self.catalog.drop_index(name)?;
-        self.rewrite_catalog()?;
+        write_catalog(&mut self.pager, &next_catalog, &self.table_heads)?;
+        self.catalog = next_catalog;
         self.indexes.drop(&index.name);
         Ok(())
     }
@@ -842,6 +856,38 @@ fn write_catalog(
     // a crash before this point can at worst leak pages, not lose catalog.
     free_catalog_chain(pager, old_root)?;
     pager.flush()?;
+    Ok(())
+}
+
+fn validate_catalog_entries_fit(
+    catalog: &Catalog,
+    heads: &std::collections::HashMap<String, PageId>,
+) -> Result<()> {
+    for (name, table) in catalog.iter() {
+        let head = *heads
+            .get(name)
+            .ok_or_else(|| Error::internal(format!("no head for `{name}`")))?;
+        validate_catalog_entry_bytes(name, head, table)?;
+    }
+    Ok(())
+}
+
+fn validate_catalog_entry_fits(table: &Table) -> Result<()> {
+    validate_catalog_entry_bytes(&table.name, 0, table)
+}
+
+fn validate_catalog_entry_bytes(name: &str, head: PageId, table: &Table) -> Result<()> {
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&head.to_le_bytes());
+    encode_table(table, &mut entry)?;
+    let max_entry = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
+    if entry.len() > max_entry {
+        return Err(Error::value(format!(
+            "catalog entry for table `{name}` is too large: {} bytes encoded, max {}",
+            entry.len(),
+            max_entry
+        )));
+    }
     Ok(())
 }
 

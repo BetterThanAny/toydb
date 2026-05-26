@@ -320,7 +320,9 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
         }
         (BinaryOp::Pow, Value::Integer(a), Value::Integer(b)) => {
             if b < 0 {
-                Value::Float((a as f64).powi(b as i32))
+                let exp =
+                    i32::try_from(b).map_err(|_| Error::value("integer exponent out of range"))?;
+                Value::Float((a as f64).powi(exp))
             } else {
                 let exp =
                     u32::try_from(b).map_err(|_| Error::value("integer exponent out of range"))?;
@@ -333,8 +335,20 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
         (BinaryOp::Add, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) + to_f64(r)),
         (BinaryOp::Sub, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) - to_f64(r)),
         (BinaryOp::Mul, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) * to_f64(r)),
-        (BinaryOp::Div, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) / to_f64(r)),
-        (BinaryOp::Mod, l, r) if numeric(&l) && numeric(&r) => Value::Float(to_f64(l) % to_f64(r)),
+        (BinaryOp::Div, l, r) if numeric(&l) && numeric(&r) => {
+            let rhs = to_f64(r);
+            if rhs == 0.0 {
+                return Err(Error::value("division by zero"));
+            }
+            Value::Float(to_f64(l) / rhs)
+        }
+        (BinaryOp::Mod, l, r) if numeric(&l) && numeric(&r) => {
+            let rhs = to_f64(r);
+            if rhs == 0.0 {
+                return Err(Error::value("modulo by zero"));
+            }
+            Value::Float(to_f64(l) % rhs)
+        }
         (BinaryOp::Pow, l, r) if numeric(&l) && numeric(&r) => {
             Value::Float(to_f64(l).powf(to_f64(r)))
         }
@@ -381,33 +395,34 @@ fn apply_comparison(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
 // SQL three-valued AND: TRUE AND NULL = NULL; FALSE AND NULL = FALSE;
 // FALSE AND _ = FALSE.
 fn apply_and(l: Value, r: Value) -> Result<Value> {
-    Ok(match (l, r) {
-        (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Value::Boolean(false),
-        (Value::Boolean(true), Value::Boolean(true)) => Value::Boolean(true),
-        (Value::Null, _) | (_, Value::Null) => Value::Null,
-        (a, b) => {
-            return Err(Error::ty(format!(
-                "AND requires booleans, got {} and {}",
-                a.type_name(),
-                b.type_name()
-            )));
-        }
+    let left = logical_operand("AND", &l)?;
+    let right = logical_operand("AND", &r)?;
+    Ok(match (left, right) {
+        (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
+        (Some(true), Some(true)) => Value::Boolean(true),
+        (None, _) | (_, None) => Value::Null,
     })
 }
 
 fn apply_or(l: Value, r: Value) -> Result<Value> {
-    Ok(match (l, r) {
-        (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Value::Boolean(true),
-        (Value::Boolean(false), Value::Boolean(false)) => Value::Boolean(false),
-        (Value::Null, _) | (_, Value::Null) => Value::Null,
-        (a, b) => {
-            return Err(Error::ty(format!(
-                "OR requires booleans, got {} and {}",
-                a.type_name(),
-                b.type_name()
-            )));
-        }
+    let left = logical_operand("OR", &l)?;
+    let right = logical_operand("OR", &r)?;
+    Ok(match (left, right) {
+        (Some(true), _) | (_, Some(true)) => Value::Boolean(true),
+        (Some(false), Some(false)) => Value::Boolean(false),
+        (None, _) | (_, None) => Value::Null,
     })
+}
+
+fn logical_operand(op: &str, value: &Value) -> Result<Option<bool>> {
+    match value {
+        Value::Boolean(b) => Ok(Some(*b)),
+        Value::Null => Ok(None),
+        other => Err(Error::ty(format!(
+            "{op} requires boolean operands, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 fn numeric(v: &Value) -> bool {
@@ -497,7 +512,11 @@ fn apply_function<R: Resolver + ?Sized>(name: &str, args: &[Expression], r: &R) 
                 )),
                 (Value::Integer(_), Value::Integer(_)) => Err(Error::value("MOD by zero")),
                 (a, b) if numeric(a) && numeric(b) => {
-                    Ok(Value::Float(to_f64(a.clone()) % to_f64(b.clone())))
+                    let rhs = to_f64(b.clone());
+                    if rhs == 0.0 {
+                        return Err(Error::value("MOD by zero"));
+                    }
+                    Ok(Value::Float(to_f64(a.clone()) % rhs))
                 }
                 _ => Err(Error::ty("MOD expects two numeric arguments")),
             }
@@ -757,6 +776,9 @@ mod tests {
     #[test]
     fn arith_div_by_zero() {
         assert!(ev_err("1 / 0").contains("division by zero"));
+        assert!(ev_err("1.0 / 0.0").contains("division by zero"));
+        assert!(ev_err("1.0 % 0.0").contains("modulo by zero"));
+        assert!(ev_err("2 ^ -2147483649").contains("exponent out of range"));
     }
 
     #[test]
@@ -802,6 +824,8 @@ mod tests {
         assert_eq!(ev("TRUE OR NULL"), Value::Boolean(true));
         assert_eq!(ev("FALSE OR NULL"), Value::Null);
         assert_eq!(ev("NOT NULL"), Value::Null);
+        assert!(ev_err("NULL AND 1").contains("requires boolean"));
+        assert!(ev_err("NULL OR 1").contains("requires boolean"));
     }
 
     // -------- string ---------------------------------------------------
@@ -951,6 +975,7 @@ mod tests {
         }
         assert_eq!(ev("MOD(10, 3)"), Value::Integer(1));
         assert!(ev_err("MOD(-9223372036854775807 - 1, -1)").contains("overflow"));
+        assert!(ev_err("MOD(1.0, 0.0)").contains("MOD by zero"));
     }
 
     #[test]

@@ -15,6 +15,13 @@ fn run(engine: &mut dyn Engine, sql: &str) -> ResultSet {
         .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"))
 }
 
+fn try_run(engine: &mut dyn Engine, sql: &str) -> Result<ResultSet, String> {
+    let stmt = Parser::parse_one(sql).map_err(|e| e.to_string())?;
+    Executor::new(engine)
+        .execute(&stmt)
+        .map_err(|e| e.to_string())
+}
+
 fn run_all(engine: &mut dyn Engine, sql: &str) {
     for stmt in Parser::parse_all(sql).unwrap() {
         Executor::new(engine).execute(&stmt).unwrap();
@@ -95,6 +102,36 @@ fn create_index_changes_explain_and_preserves_results() {
     run(&mut e, "DROP INDEX idx_users_age");
     let drop_plan = explain(&mut e, "EXPLAIN SELECT id, name FROM users WHERE age = 20");
     assert!(drop_plan.contains("SeqScan"), "{drop_plan}");
+}
+
+#[test]
+fn disk_failed_create_index_does_not_leave_planner_ghost() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (a INT, b INT);
+            INSERT INTO t VALUES (1, 2);
+        ",
+        );
+
+        let long_a = format!("idxa_{}", "a".repeat(7950));
+        let long_b = format!("idxb_{}", "b".repeat(300));
+        run(&mut e, &format!("CREATE INDEX {long_a} ON t(a)"));
+        let err = try_run(&mut e, &format!("CREATE INDEX {long_b} ON t(b)")).unwrap_err();
+        assert!(err.contains("catalog entry"), "{err}");
+
+        let plan = explain(&mut e, "EXPLAIN SELECT a FROM t WHERE b = 2");
+        assert!(plan.contains("SeqScan"), "{plan}");
+        assert!(!plan.contains("IndexScan"), "{plan}");
+
+        let rows = select_rows(run(&mut e, "SELECT a FROM t WHERE b = 2"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Integer(1));
+    }
+    cleanup(&path);
 }
 
 #[test]

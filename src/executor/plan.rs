@@ -8,7 +8,7 @@
 //! either pipeline picks it up.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::catalog::{Column, Index, Table};
 use crate::engine::{Engine, RowId};
@@ -156,6 +156,7 @@ impl<'a> Executor<'a> {
         if let Expression::Scalar(inner) = e {
             // Recursively resolve nested subqueries.
             self.resolve_subqueries_select(inner)?;
+            reject_unsupported_correlated_subquery(inner)?;
             let value = self.run_scalar_subquery(inner)?;
             *e = Expression::Literal(literal_for_value(value));
             return Ok(());
@@ -498,21 +499,8 @@ impl<'a> Executor<'a> {
             rows = kept;
         }
 
-        // Detect aggregates anywhere in SELECT / HAVING.
-        let mut aggs: Vec<(AggKey, AggSpec)> = Vec::new();
-        for item in &s.items {
-            if let SelectItem::Expr { expr, .. } = item {
-                collect_aggregates(expr, &mut aggs)?;
-            }
-        }
-        if let Some(having) = &s.having {
-            collect_aggregates(having, &mut aggs)?;
-        }
-        for ob in &s.order_by {
-            collect_aggregates(&ob.expr, &mut aggs)?;
-        }
-
-        let grouped = !s.group_by.is_empty() || !aggs.is_empty();
+        let aggs = collect_select_aggregates(s)?;
+        let grouped = !s.group_by.is_empty() || !aggs.is_empty() || s.having.is_some();
 
         if grouped {
             self.project_grouped(s, &schema, rows, aggs)
@@ -527,8 +515,15 @@ impl<'a> Executor<'a> {
         {
             return Err(Error::other("WHERE/ORDER/LIMIT/OFFSET need a FROM clause"));
         }
-        if !s.group_by.is_empty() || s.having.is_some() {
-            return Err(Error::other("GROUP BY / HAVING need a FROM clause"));
+        if !s.group_by.is_empty() {
+            return Err(Error::other("GROUP BY needs a FROM clause"));
+        }
+        let aggs = collect_select_aggregates(s)?;
+        if !aggs.is_empty() || s.having.is_some() {
+            let schema = WideSchema {
+                columns: Vec::new(),
+            };
+            return self.project_grouped(s, &schema, vec![Row(Vec::new())], aggs);
         }
         let mut columns = Vec::with_capacity(s.items.len());
         let mut row = Vec::with_capacity(s.items.len());
@@ -1002,6 +997,137 @@ impl<'a> Executor<'a> {
         let count = victims.len();
         self.engine.delete_batch(&d.table, &victims)?;
         Ok(ResultSet::Delete { count })
+    }
+}
+
+fn collect_select_aggregates(s: &SelectStmt) -> Result<Vec<(AggKey, AggSpec)>> {
+    let mut aggs: Vec<(AggKey, AggSpec)> = Vec::new();
+    for item in &s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_aggregates(expr, &mut aggs)?;
+        }
+    }
+    if let Some(having) = &s.having {
+        collect_aggregates(having, &mut aggs)?;
+    }
+    for ob in &s.order_by {
+        collect_aggregates(&ob.expr, &mut aggs)?;
+    }
+    Ok(aggs)
+}
+
+fn reject_unsupported_correlated_subquery(s: &SelectStmt) -> Result<()> {
+    let allowed = from_qualifiers(s.from.as_ref());
+    let mut refs = BTreeSet::new();
+    collect_qualified_refs_select(s, &mut refs);
+    if refs.iter().any(|qualifier| !allowed.contains(qualifier)) {
+        return Err(Error::other("correlated subqueries are not supported"));
+    }
+    Ok(())
+}
+
+fn from_qualifiers(from: Option<&FromClause>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if let Some(from) = from {
+        collect_from_qualifiers(from, &mut out);
+    }
+    out
+}
+
+fn collect_from_qualifiers(from: &FromClause, out: &mut BTreeSet<String>) {
+    match from {
+        FromClause::Table { name, alias } => {
+            out.insert(name.clone());
+            if let Some(alias) = alias {
+                out.insert(alias.clone());
+            }
+        }
+        FromClause::Join { left, right, .. } => {
+            collect_from_qualifiers(left, out);
+            collect_from_qualifiers(right, out);
+        }
+    }
+}
+
+fn collect_qualified_refs_select(s: &SelectStmt, out: &mut BTreeSet<String>) {
+    for item in &s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_qualified_refs_expr(expr, out);
+        }
+    }
+    if let Some(expr) = &s.r#where {
+        collect_qualified_refs_expr(expr, out);
+    }
+    for expr in &s.group_by {
+        collect_qualified_refs_expr(expr, out);
+    }
+    if let Some(expr) = &s.having {
+        collect_qualified_refs_expr(expr, out);
+    }
+    for ob in &s.order_by {
+        collect_qualified_refs_expr(&ob.expr, out);
+    }
+    if let Some(expr) = &s.limit {
+        collect_qualified_refs_expr(expr, out);
+    }
+    if let Some(expr) = &s.offset {
+        collect_qualified_refs_expr(expr, out);
+    }
+}
+
+fn collect_qualified_refs_expr(expr: &Expression, out: &mut BTreeSet<String>) {
+    match expr {
+        Expression::Qualified(qualifier, _) => {
+            out.insert(qualifier.clone());
+        }
+        Expression::Unary(_, inner) => collect_qualified_refs_expr(inner, out),
+        Expression::Binary(left, _, right) => {
+            collect_qualified_refs_expr(left, out);
+            collect_qualified_refs_expr(right, out);
+        }
+        Expression::IsNull { expr, .. } => collect_qualified_refs_expr(expr, out),
+        Expression::InList { expr, list, .. } => {
+            collect_qualified_refs_expr(expr, out);
+            for item in list {
+                collect_qualified_refs_expr(item, out);
+            }
+        }
+        Expression::Between {
+            expr, low, high, ..
+        } => {
+            collect_qualified_refs_expr(expr, out);
+            collect_qualified_refs_expr(low, out);
+            collect_qualified_refs_expr(high, out);
+        }
+        Expression::Like { expr, pattern, .. } => {
+            collect_qualified_refs_expr(expr, out);
+            collect_qualified_refs_expr(pattern, out);
+        }
+        Expression::Function { args, .. } => {
+            for arg in args {
+                collect_qualified_refs_expr(arg, out);
+            }
+        }
+        Expression::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(operand) = operand {
+                collect_qualified_refs_expr(operand, out);
+            }
+            for (when, then) in branches {
+                collect_qualified_refs_expr(when, out);
+                collect_qualified_refs_expr(then, out);
+            }
+            if let Some(otherwise) = otherwise {
+                collect_qualified_refs_expr(otherwise, out);
+            }
+        }
+        Expression::Scalar(_)
+        | Expression::Column(_)
+        | Expression::Literal(_)
+        | Expression::Wildcard => {}
     }
 }
 
