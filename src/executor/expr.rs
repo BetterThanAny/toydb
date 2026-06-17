@@ -202,6 +202,7 @@ pub fn eval_with<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Value
             branches,
             otherwise,
         } => {
+            validate_case_expression(operand.as_deref(), branches, otherwise.as_deref(), r)?;
             // Switch form evaluates `operand` once and compares it against
             // each WHEN expression with SQL equality (NULL never matches).
             // Boolean form treats each WHEN as a predicate.
@@ -583,12 +584,11 @@ fn infer_expr_kind<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Exp
             infer_expr_kind(pattern, r)?;
             ExprKind::Boolean
         }
-        Expression::Function { args, .. } => {
-            for arg in args {
-                infer_expr_kind(arg, r)?;
-            }
-            ExprKind::Unknown
-        }
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } => infer_function_kind(name, args, *distinct, r)?,
         Expression::Scalar(_) => {
             return Err(Error::internal(
                 "scalar subqueries must be resolved before eval (executor bug)",
@@ -618,6 +618,37 @@ fn infer_expr_kind<R: Resolver + ?Sized>(expr: &Expression, r: &R) -> Result<Exp
     })
 }
 
+fn validate_case_expression<R: Resolver + ?Sized>(
+    operand: Option<&Expression>,
+    branches: &[(Expression, Expression)],
+    otherwise: Option<&Expression>,
+    r: &R,
+) -> Result<()> {
+    if let Some(op) = operand {
+        let operand_kind = infer_expr_kind(op, r)?;
+        for (when, then) in branches {
+            let when_kind = infer_expr_kind(when, r)?;
+            if !comparison_kinds_compatible(operand_kind, when_kind) {
+                return Err(Error::ty(format!(
+                    "CASE operand cannot compare {} with {}",
+                    operand_kind.type_name(),
+                    when_kind.type_name()
+                )));
+            }
+            infer_expr_kind(then, r)?;
+        }
+    } else {
+        for (when, then) in branches {
+            validate_short_circuit_boolean_operand(when, r, "CASE WHEN")?;
+            infer_expr_kind(then, r)?;
+        }
+    }
+    if let Some(otherwise) = otherwise {
+        infer_expr_kind(otherwise, r)?;
+    }
+    Ok(())
+}
+
 fn comparison_kinds_compatible(left: ExprKind, right: ExprKind) -> bool {
     matches!(left, ExprKind::Null | ExprKind::Unknown)
         || matches!(right, ExprKind::Null | ExprKind::Unknown)
@@ -635,6 +666,220 @@ fn to_f64(v: Value) -> f64 {
         Value::Float(f) => f,
         _ => f64::NAN,
     }
+}
+
+fn infer_function_kind<R: Resolver + ?Sized>(
+    name: &str,
+    args: &[Expression],
+    distinct: bool,
+    r: &R,
+) -> Result<ExprKind> {
+    if distinct {
+        return Err(Error::ty(format!(
+            "DISTINCT is only supported inside aggregate calls, not `{name}`"
+        )));
+    }
+    let upper = name.to_ascii_uppercase();
+    if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+        return Err(Error::internal(format!(
+            "aggregate `{name}` reached scalar evaluator"
+        )));
+    }
+    match upper.as_str() {
+        "COALESCE" => {
+            let mut kinds = Vec::with_capacity(args.len());
+            for arg in args {
+                kinds.push(infer_expr_kind(arg, r)?);
+            }
+            Ok(common_result_kind(&kinds))
+        }
+        "ABS" => numeric_unary_kind(name, args, r, false),
+        "ROUND" | "FLOOR" | "CEILING" | "CEIL" | "SQRT" | "SIN" | "COS" | "TAN" | "EXP" | "LN"
+        | "LOG" | "LOG10" => numeric_unary_kind(name, args, r, true),
+        "LENGTH" => string_args_kind(name, args, r, 1, ExprKind::Integer),
+        "LOWER" | "UPPER" | "TRIM" | "LTRIM" | "RTRIM" | "REVERSE" => {
+            string_args_kind(name, args, r, 1, ExprKind::String)
+        }
+        "POWER" | "POW" => numeric_args_kind(name, args, r, 2, ExprKind::Float),
+        "MOD" => {
+            check_expr_arity(name, 2, args)?;
+            let left = infer_expr_kind(&args[0], r)?;
+            let right = infer_expr_kind(&args[1], r)?;
+            require_numeric_or_null(name, left)?;
+            require_numeric_or_null(name, right)?;
+            Ok(match (left, right) {
+                (ExprKind::Integer, ExprKind::Integer) => ExprKind::Integer,
+                (ExprKind::Null, _) | (_, ExprKind::Null) => ExprKind::Null,
+                (ExprKind::Unknown, _) | (_, ExprKind::Unknown) => ExprKind::Unknown,
+                _ => ExprKind::Float,
+            })
+        }
+        "REPEAT" => {
+            check_expr_arity(name, 2, args)?;
+            let s = infer_expr_kind(&args[0], r)?;
+            let n = infer_expr_kind(&args[1], r)?;
+            require_string_or_null(name, s)?;
+            match n {
+                ExprKind::Integer | ExprKind::Null | ExprKind::Unknown => Ok(ExprKind::String),
+                other => Err(Error::ty(format!(
+                    "{name} expects integer repeat count, got {}",
+                    other.type_name()
+                ))),
+            }
+        }
+        "REPLACE" => string_args_kind(name, args, r, 3, ExprKind::String),
+        "SUBSTRING" | "SUBSTR" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(Error::ty("SUBSTRING takes 2 or 3 arguments"));
+            }
+            let s = infer_expr_kind(&args[0], r)?;
+            require_string_or_null(name, s)?;
+            for arg in &args[1..] {
+                let kind = infer_expr_kind(arg, r)?;
+                match kind {
+                    ExprKind::Integer | ExprKind::Null | ExprKind::Unknown => {}
+                    other => {
+                        return Err(Error::ty(format!(
+                            "{name} expects integer position/length, got {}",
+                            other.type_name()
+                        )));
+                    }
+                }
+            }
+            Ok(ExprKind::String)
+        }
+        "CONCAT" => {
+            for arg in args {
+                infer_expr_kind(arg, r)?;
+            }
+            Ok(ExprKind::String)
+        }
+        "NULLIF" => {
+            check_expr_arity(name, 2, args)?;
+            let left = infer_expr_kind(&args[0], r)?;
+            let right = infer_expr_kind(&args[1], r)?;
+            if !comparison_kinds_compatible(left, right) {
+                return Err(Error::ty(format!(
+                    "cannot compare {} with {}",
+                    left.type_name(),
+                    right.type_name()
+                )));
+            }
+            Ok(left)
+        }
+        "IFF" => {
+            check_expr_arity(name, 3, args)?;
+            validate_short_circuit_boolean_operand(&args[0], r, "IFF")?;
+            let then_kind = infer_expr_kind(&args[1], r)?;
+            let else_kind = infer_expr_kind(&args[2], r)?;
+            Ok(common_result_kind(&[then_kind, else_kind]))
+        }
+        _ => Err(Error::ty(format!("unknown function `{name}`"))),
+    }
+}
+
+fn check_expr_arity(name: &str, want: usize, args: &[Expression]) -> Result<()> {
+    if args.len() != want {
+        return Err(Error::ty(format!(
+            "{name} takes {want} argument{}, got {}",
+            if want == 1 { "" } else { "s" },
+            args.len()
+        )));
+    }
+    Ok(())
+}
+
+fn numeric_unary_kind<R: Resolver + ?Sized>(
+    name: &str,
+    args: &[Expression],
+    r: &R,
+    force_float: bool,
+) -> Result<ExprKind> {
+    check_expr_arity(name, 1, args)?;
+    let kind = infer_expr_kind(&args[0], r)?;
+    require_numeric_or_null(name, kind)?;
+    Ok(match kind {
+        ExprKind::Null | ExprKind::Unknown => kind,
+        ExprKind::Integer if !force_float => ExprKind::Integer,
+        _ => ExprKind::Float,
+    })
+}
+
+fn numeric_args_kind<R: Resolver + ?Sized>(
+    name: &str,
+    args: &[Expression],
+    r: &R,
+    arity: usize,
+    result: ExprKind,
+) -> Result<ExprKind> {
+    check_expr_arity(name, arity, args)?;
+    let mut saw_null = false;
+    let mut saw_unknown = false;
+    for arg in args {
+        let kind = infer_expr_kind(arg, r)?;
+        require_numeric_or_null(name, kind)?;
+        saw_null |= kind == ExprKind::Null;
+        saw_unknown |= kind == ExprKind::Unknown;
+    }
+    Ok(if saw_unknown {
+        ExprKind::Unknown
+    } else if saw_null {
+        ExprKind::Null
+    } else {
+        result
+    })
+}
+
+fn string_args_kind<R: Resolver + ?Sized>(
+    name: &str,
+    args: &[Expression],
+    r: &R,
+    arity: usize,
+    result: ExprKind,
+) -> Result<ExprKind> {
+    check_expr_arity(name, arity, args)?;
+    for arg in args {
+        let kind = infer_expr_kind(arg, r)?;
+        require_string_or_null(name, kind)?;
+    }
+    Ok(result)
+}
+
+fn require_numeric_or_null(name: &str, kind: ExprKind) -> Result<()> {
+    match kind {
+        ExprKind::Integer | ExprKind::Float | ExprKind::Null | ExprKind::Unknown => Ok(()),
+        other => Err(Error::ty(format!(
+            "{name} expects numeric, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn require_string_or_null(name: &str, kind: ExprKind) -> Result<()> {
+    match kind {
+        ExprKind::String | ExprKind::Null | ExprKind::Unknown => Ok(()),
+        other => Err(Error::ty(format!(
+            "{name} expects string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn common_result_kind(kinds: &[ExprKind]) -> ExprKind {
+    let mut out: Option<ExprKind> = None;
+    for kind in kinds {
+        match (*kind, out) {
+            (ExprKind::Null | ExprKind::Unknown, _) => {}
+            (kind, None) => out = Some(kind),
+            (ExprKind::Integer, Some(ExprKind::Float))
+            | (ExprKind::Float, Some(ExprKind::Integer | ExprKind::Float)) => {
+                out = Some(ExprKind::Float);
+            }
+            (kind, Some(prev)) if kind == prev => {}
+            _ => return ExprKind::Unknown,
+        }
+    }
+    out.unwrap_or(ExprKind::Unknown)
 }
 
 // ---------------------------------------------------------------------

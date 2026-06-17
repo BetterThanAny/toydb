@@ -543,6 +543,35 @@ fn short_circuit_still_validates_boolean_operands_and_columns() {
 }
 
 #[test]
+fn skipped_expression_branches_still_bind_functions_and_types() {
+    let mut e = MemoryEngine::new();
+    run_all(
+        &mut e,
+        "
+        CREATE TABLE t (id INT);
+        INSERT INTO t VALUES (1);
+    ",
+    );
+
+    let err = try_run(
+        &mut e,
+        "SELECT id FROM t WHERE FALSE AND definitely_missing_fn()",
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown function"), "{err}");
+
+    let err = try_run(&mut e, "SELECT id FROM t WHERE FALSE AND ABS(1)").unwrap_err();
+    assert!(err.contains("requires boolean"), "{err}");
+
+    let err = try_run(
+        &mut e,
+        "SELECT CASE WHEN TRUE THEN 1 WHEN definitely_missing_fn() THEN 2 ELSE 3 END",
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown function"), "{err}");
+}
+
+#[test]
 fn having_without_group_or_aggregate_is_rejected() {
     let mut e = MemoryEngine::new();
     run_all(

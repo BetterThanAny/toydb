@@ -279,6 +279,43 @@ fn wal_replay_survives_delete_insert_slot_reuse() {
 }
 
 #[test]
+fn wal_replay_survives_drop_recreate_same_table_name() {
+    let path = tmpdb();
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        run_all(
+            &mut e,
+            "
+            CREATE TABLE t (id INT PRIMARY KEY, old_col INT);
+            CREATE INDEX idx_t_old ON t(old_col);
+            INSERT INTO t VALUES (1, 10);
+            DROP TABLE t;
+            CREATE TABLE t (id INT PRIMARY KEY, new_col TEXT);
+            INSERT INTO t VALUES (1, 'new');
+        ",
+        );
+        // Simulate a process crash: replay must not apply old table/index
+        // records to the later table incarnation with the same name.
+        std::mem::forget(e);
+    }
+    {
+        let mut e = DiskEngine::open(&path).unwrap();
+        let r = run(&mut e, "SELECT id, new_col FROM t ORDER BY id");
+        match r {
+            ResultSet::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(1));
+                assert_eq!(rows[0][1], Value::String("new".into()));
+            }
+            _ => panic!(),
+        }
+        let err = try_run(&mut e, "SELECT old_col FROM t").unwrap_err();
+        assert!(err.contains("no such column `old_col`"), "{err}");
+    }
+    cleanup(&path);
+}
+
+#[test]
 fn wal_replay_recovers_multi_value_insert_as_batch() {
     let path = tmpdb();
     {

@@ -978,6 +978,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 if !catalog.contains(name) {
                     continue;
                 }
+                if current_table_matches_later_create(&catalog, &recs, idx, name) {
+                    continue;
+                }
                 let head = *heads
                     .get(name)
                     .ok_or_else(|| Error::internal(format!("replay: missing head for `{name}`")))?;
@@ -1003,6 +1006,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 if !catalog.contains(table) {
                     continue;
                 }
+                if current_table_matches_later_create(&catalog, &recs, idx, table) {
+                    continue;
+                }
                 for page_id in pages {
                     if *page_id == 0 || *page_id >= pager.page_count() {
                         continue;
@@ -1016,6 +1022,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 heads.remove(table);
             }
             LogRecord::CreateIndex(index) => {
+                if has_later_drop_for_table(&recs, idx, &index.table) {
+                    continue;
+                }
                 if !catalog.contains(&index.table) || catalog.index_exists(&index.name) {
                     continue;
                 }
@@ -1027,6 +1036,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 }
             }
             LogRecord::Insert { table, id, row } => {
+                if has_later_drop_for_table(&recs, idx, table) {
+                    continue;
+                }
                 if !catalog.contains(table) {
                     // Table was dropped later in the WAL; the
                     // subsequent DropTable record will free its pages.
@@ -1053,6 +1065,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 pager.write_page(page_id, page)?;
             }
             LogRecord::InsertBatch { table, rows } => {
+                if has_later_drop_for_table(&recs, idx, table) {
+                    continue;
+                }
                 if !catalog.contains(table) {
                     continue;
                 }
@@ -1075,6 +1090,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 }
             }
             LogRecord::Update { table, id, row } => {
+                if has_later_drop_for_table(&recs, idx, table) {
+                    continue;
+                }
                 if !catalog.contains(table) {
                     continue;
                 }
@@ -1092,6 +1110,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 pager.write_page(page_id, page)?;
             }
             LogRecord::UpdateBatch { table, rows } => {
+                if has_later_drop_for_table(&recs, idx, table) {
+                    continue;
+                }
                 if !catalog.contains(table) {
                     continue;
                 }
@@ -1111,6 +1132,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 }
             }
             LogRecord::Delete { table, id } => {
+                if has_later_drop_for_table(&recs, idx, table) {
+                    continue;
+                }
                 if !catalog.contains(table) {
                     continue;
                 }
@@ -1123,6 +1147,9 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
                 pager.write_page(page_id, page)?;
             }
             LogRecord::DeleteBatch { table, ids } => {
+                if has_later_drop_for_table(&recs, idx, table) {
+                    continue;
+                }
                 if !catalog.contains(table) {
                     continue;
                 }
@@ -1142,6 +1169,37 @@ fn replay_wal(pager: &mut Pager, wal: &mut Wal) -> Result<()> {
     pager.flush()?;
     wal.truncate()?;
     Ok(())
+}
+
+fn has_later_drop_for_table(recs: &[LogRecord], idx: usize, table: &str) -> bool {
+    recs[idx + 1..].iter().any(|rec| match rec {
+        LogRecord::DropTable(name) => name == table,
+        LogRecord::DropTablePages { table: name, .. } => name == table,
+        _ => false,
+    })
+}
+
+fn current_table_matches_later_create(
+    catalog: &Catalog,
+    recs: &[LogRecord],
+    idx: usize,
+    table: &str,
+) -> bool {
+    let Ok(current) = catalog.get(table) else {
+        return false;
+    };
+    recs[idx + 1..].iter().any(|rec| match rec {
+        LogRecord::CreateTable(later) if later.name == table => {
+            same_table_generation(current, later)
+        }
+        _ => false,
+    })
+}
+
+fn same_table_generation(current: &Table, create_record: &Table) -> bool {
+    current.name == create_record.name
+        && current.columns == create_record.columns
+        && current.primary_key == create_record.primary_key
 }
 
 fn has_later_record_for_row(recs: &[LogRecord], idx: usize, table: &str, id: RowId) -> bool {
